@@ -1,0 +1,12 @@
+services:
+  mapper-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app # 내 컴퓨터 폴더와 도커 /app 폴더 동기화
+      - /app/node_modules # 도커 내부의 부품 저장소는 보호
+    environment:
+      - CHOKIDAR_USEPOLLING=true # 파일 변경 감지 보조 옵션

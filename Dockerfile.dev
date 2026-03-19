@@ -1,0 +1,13 @@
+# 개발용 가벼운 Node 환경
+FROM node:20-alpine
+WORKDIR /app
+
+# 부품 먼저 설치 (캐싱 활용)
+COPY package*.json ./
+RUN npm install
+
+# 나머지 파일 복사
+COPY . .
+
+# Vite 개발 서버 실행 (외부 접속 허용)
+CMD ["npm", "run", "dev", "--", "--host"]
