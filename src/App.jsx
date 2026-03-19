@@ -5,87 +5,80 @@ import JSZip from "jszip";
 
 /* ═══════════════════════════════════════════════════════════════
    AI SINGLETONS
-   depth-anything-v2: MiDaS 대비 정확도 대폭 향상
-   segformer: ADE20k 150-class 재질 분류 → material mask
 ═══════════════════════════════════════════════════════════════ */
-let _depthPromise = null;
-let _segPromise = null;
-
+let _depthP = null,
+  _segP = null;
 const getDepth = () => {
-  if (!_depthPromise)
-    _depthPromise = pipeline(
+  if (!_depthP)
+    _depthP = pipeline(
       "depth-estimation",
-      "Xenova/depth-anything-v2",
+      "onnx-community/depth-anything-v2-base",
+      {
+        device: "wasm",
+        dtype: "fp32", // 압축을 푼 고정밀도 최고 화질 모델
+      },
     ).catch((e) => {
-      _depthPromise = null;
+      _depthP = null;
       throw e;
     });
-  return _depthPromise;
+  return _depthP;
 };
-
-const getSegmenter = () => {
-  if (!_segPromise)
-    _segPromise = pipeline(
+const getSeg = () => {
+  if (!_segP)
+    _segP = pipeline(
       "image-segmentation",
       "Xenova/segformer-b0-finetuned-ade-512-512",
     ).catch((e) => {
-      _segPromise = null;
+      _segP = null;
       throw e;
     });
-  return _segPromise;
+  return _segP;
 };
 
 /* ═══════════════════════════════════════════════════════════════
-   GPU CAPABILITY QUERY
+   GPU QUERY
 ═══════════════════════════════════════════════════════════════ */
 function queryGPU() {
   try {
-    const c = document.createElement("canvas");
-    const gl = c.getContext("webgl2");
-    if (!gl) return { maxTex: 2048, renderer: "WebGL2 unavailable" };
+    const c = document.createElement("canvas"),
+      gl = c.getContext("webgl2");
+    if (!gl) return { maxTex: 2048, renderer: "WebGL2 N/A" };
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     const ext = gl.getExtension("WEBGL_debug_renderer_info");
-    const renderer = ext
-      ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)
-      : "GPU info unavailable";
+    const renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : "GPU";
     gl.getExtension("WEBGL_lose_context")?.loseContext();
     return { maxTex, renderer };
   } catch {
-    return { maxTex: 2048, renderer: "Query failed" };
+    return { maxTex: 2048, renderer: "N/A" };
   }
 }
-
-// 파이프라인 중간 텍스처 수 기반 VRAM 추정 (MB)
 const vramMB = (res) => Math.round((res * res * 4 * 12) / 1024 / 1024);
 
 /* ═══════════════════════════════════════════════════════════════
    PROCEDURAL HDRI
 ═══════════════════════════════════════════════════════════════ */
-const HDRI_PRESETS = {
+const HDRI = {
   studio: {
-    label: "STUDIO",
     sky: ["#0d1020", "#1a2040", "#404860", "#707890"],
     key: { color: "#ffe8c8", x: 140, y: 55, r: 90 },
     fill: { color: "#c8d8ff", x: 380, y: 100, r: 60 },
     ground: "#181020",
   },
   outdoor: {
-    label: "OUTDOOR",
     sky: ["#0a1a40", "#1a4090", "#4090d0", "#90c8f0"],
     key: { color: "#fff4d0", x: 100, y: 40, r: 110 },
     fill: { color: "#80b0e0", x: 450, y: 80, r: 80 },
     ground: "#2a3018",
   },
   warm: {
-    label: "WARM",
     sky: ["#100810", "#302030", "#704830", "#c07040"],
     key: { color: "#ffd090", x: 160, y: 50, r: 100 },
     fill: { color: "#ff8040", x: 400, y: 90, r: 55 },
     ground: "#201008",
   },
 };
-function buildEnvMap(renderer, key) {
-  const p = HDRI_PRESETS[key];
+function buildEnv(renderer, key) {
+  const p = HDRI[key];
   const W = 1024,
     H = 512;
   const c = document.createElement("canvas");
@@ -104,380 +97,174 @@ function buildEnvMap(renderer, key) {
   [p.key, p.fill].forEach(({ color, x, y, r }) => {
     const g = ctx.createRadialGradient(x, y, 0, x, y, r);
     g.addColorStop(0, color + "ee");
-    g.addColorStop(0.4, color + "66");
+    g.addColorStop(0.4, color + "55");
     g.addColorStop(1, color + "00");
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, W, H);
   });
   const tex = new THREE.CanvasTexture(c);
   tex.mapping = THREE.EquirectangularReflectionMapping;
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  pmrem.compileEquirectangularShader();
-  const env = pmrem.fromEquirectangular(tex).texture;
-  pmrem.dispose();
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const pm = new THREE.PMREMGenerator(renderer);
+  pm.compileEquirectangularShader();
+  const env = pm.fromEquirectangular(tex).texture;
+  pm.dispose();
   tex.dispose();
   return env;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   MATERIAL CLASS MAPPING  (ADE20k label → 0..4)
-   0 = organic/dielectric  metal≈0  rough≈0.78
-   1 = metal               metal≈0.9 rough≈0.38
-   2 = stone/concrete      metal≈0  rough≈0.86
-   3 = fabric/soft         metal≈0  rough≈0.92
-   4 = plastic/glass       metal≈0  rough≈0.22
+   MATERIAL CLASS (ADE20k → 0..4)
 ═══════════════════════════════════════════════════════════════ */
-const LABEL_TO_CLASS = (() => {
-  const m = {};
-  const assign = (cls, labels) =>
-    labels.forEach((l) => {
-      m[l] = cls;
-    });
-  assign(1, [
-    "car",
-    "bus",
-    "truck",
-    "van",
-    "train",
-    "airplane",
-    "boat",
-    "bicycle",
-    "motorbike",
-    "radiator",
-    "refrigerator",
-    "sink",
-    "oven",
-    "microwave",
-    "washing machine",
-    "dishwasher",
-  ]);
-  assign(2, [
-    "wall",
-    "floor",
-    "ceiling",
-    "building",
-    "column",
-    "bridge",
-    "pavement",
-    "path",
-    "rock",
-    "stone",
-    "stairway",
-    "steps",
-  ]);
-  assign(3, [
-    "curtain",
-    "sofa",
-    "bed",
-    "pillow",
-    "blanket",
-    "mat",
-    "carpet",
-    "rug",
-    "cushion",
-  ]);
-  assign(4, [
-    "bottle",
-    "glass",
-    "window",
-    "jar",
-    "cup",
-    "bowl",
-    "vase",
-    "lamp",
-  ]);
-  // default 0: tree, table, chair, grass, plant, wood, etc.
-  return m;
-})();
-
-function labelToClass(label) {
-  const l = label.toLowerCase();
-  for (const [k, v] of Object.entries(LABEL_TO_CLASS)) {
-    if (l.includes(k)) return v;
-  }
+const LABEL_MAP = {
+  car: 1,
+  bus: 1,
+  truck: 1,
+  metal: 1,
+  steel: 1,
+  iron: 1,
+  wall: 2,
+  floor: 2,
+  rock: 2,
+  stone: 2,
+  concrete: 2,
+  building: 2,
+  curtain: 3,
+  sofa: 3,
+  bed: 3,
+  fabric: 3,
+  cloth: 3,
+  rug: 3,
+  bottle: 4,
+  glass: 4,
+  window: 4,
+  plastic: 4,
+  jar: 4,
+};
+const labelCls = (l) => {
+  const low = l.toLowerCase();
+  for (const [k, v] of Object.entries(LABEL_MAP)) if (low.includes(k)) return v;
   return 0;
-}
+};
 
-// Segmentation → single-channel material mask canvas (512×512)
-async function buildMaterialMask(segments) {
-  const S = 512;
-  const c = document.createElement("canvas");
+async function buildMatMask(segs) {
+  const S = 512,
+    c = document.createElement("canvas");
   c.width = c.height = S;
   const ctx = c.getContext("2d", { willReadFrequently: true });
   const id = ctx.createImageData(S, S);
-
-  // Default class 0 (encoded as 0)
   id.data.fill(0);
   for (let i = 3; i < id.data.length; i += 4) id.data[i] = 255;
-
-  for (const seg of segments || []) {
+  for (const seg of segs || []) {
     if (!seg?.mask) continue;
-    const cls = labelToClass(seg.label || "");
-    const encoded = Math.round((cls / 4) * 255);
+    const cls = labelCls(seg.label || "");
+    const enc = Math.round((cls / 4) * 255);
     try {
-      const mc = seg.mask.toCanvas ? seg.mask.toCanvas() : null;
+      const mc = seg.mask.toCanvas?.();
       if (!mc) continue;
-      const tmpC = document.createElement("canvas");
-      tmpC.width = tmpC.height = S;
-      tmpC.getContext("2d").drawImage(mc, 0, 0, S, S);
-      const md = tmpC.getContext("2d").getImageData(0, 0, S, S).data;
-      for (let i = 0; i < id.data.length; i += 4) {
+      const tc = document.createElement("canvas");
+      tc.width = tc.height = S;
+      tc.getContext("2d").drawImage(mc, 0, 0, S, S);
+      const md = tc.getContext("2d").getImageData(0, 0, S, S).data;
+      for (let i = 0; i < id.data.length; i += 4)
         if (md[i] > 128) {
-          id.data[i] = encoded;
+          id.data[i] = enc;
           id.data[i + 1] = 0;
           id.data[i + 2] = 0;
         }
-      }
-    } catch {
-      /* skip bad masks */
-    }
+    } catch {}
   }
-
   ctx.putImageData(id, 0, 0);
   return c;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   GLSL3 SHADERS  — v6 (Bilateral / HBAO / MultiCurv / FreqRough)
+   GLSL3 SHADERS
 ═══════════════════════════════════════════════════════════════ */
-const VS = `#version 300 es
-in vec2 a; out vec2 v;
-void main(){ v=a*.5+.5; gl_Position=vec4(a,0.,1.); }`;
-
-const FS_PASS = `#version 300 es precision highp float;
-uniform sampler2D T; in vec2 v; out vec4 o;
-void main(){ o=texture(T,v); }`;
-
-const FS_BLUR_H = `#version 300 es precision highp float;
-uniform sampler2D T; uniform vec2 px; uniform float radius;
-in vec2 v; out vec4 o;
-const float W[5]=float[](0.227027,0.194595,0.121622,0.054054,0.016216);
-void main(){ vec4 c=texture(T,v)*W[0];
-  for(int i=1;i<5;i++) c+=texture(T,v+vec2(float(i)*px.x*radius,0.))*W[i]+texture(T,v-vec2(float(i)*px.x*radius,0.))*W[i];
-  o=c; }`;
-
-const FS_BLUR_V = `#version 300 es precision highp float;
-uniform sampler2D T; uniform vec2 px; uniform float radius;
-in vec2 v; out vec4 o;
-const float W[5]=float[](0.227027,0.194595,0.121622,0.054054,0.016216);
-void main(){ vec4 c=texture(T,v)*W[0];
-  for(int i=1;i<5;i++) c+=texture(T,v+vec2(0.,float(i)*px.y*radius))*W[i]+texture(T,v-vec2(0.,float(i)*px.y*radius))*W[i];
-  o=c; }`;
-
-const FS_HIGHPASS = `#version 300 es precision highp float;
-uniform sampler2D ORIG,BLUR; in vec2 v; out vec4 o;
-void main(){ o=clamp(texture(ORIG,v)-texture(BLUR,v)+vec4(.5),0.,1.); }`;
-
-// ── BILATERAL NORMAL ─────────────────────────────────────────
-// 각 Sobel 샘플을 depth 유사도로 가중 → 깊이 경계에서 노멀 번짐 방지
-const FS_NORMAL = `#version 300 es precision highp float;
-uniform sampler2D DEPTH,DETAIL; uniform vec2 px; uniform float str,detailMix,sigma;
-in vec2 v; out vec4 o;
-float bilW(float dc,float ds){ float d=dc-ds; return exp(-d*d/(sigma*sigma+0.0001)); }
-float hD(vec2 u){ return texture(DEPTH,u).r; }
-float hA(vec2 u){ return texture(DETAIL,u).r-.5; }
+const VS = `#version 300 es\nin vec2 a;out vec2 v;\nvoid main(){v=a*.5+.5;gl_Position=vec4(a,0.,1.);}`;
+const FS_PASS = `#version 300 es\nprecision highp float;\nuniform sampler2D T;in vec2 v;out vec4 o;\nvoid main(){o=texture(T,v);}`;
+const FS_BH = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius;in vec2 v;out vec4 o;const float W[5]=float[](0.227027,0.194595,0.121622,0.054054,0.016216);void main(){vec4 c=texture(T,v)*W[0];for(int i=1;i<5;i++)c+=texture(T,v+vec2(float(i)*px.x*radius,0.))*W[i]+texture(T,v-vec2(float(i)*px.x*radius,0.))*W[i];o=c;}`;
+const FS_BV = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius;in vec2 v;out vec4 o;const float W[5]=float[](0.227027,0.194595,0.121622,0.054054,0.016216);void main(){vec4 c=texture(T,v)*W[0];for(int i=1;i<5;i++)c+=texture(T,v+vec2(0.,float(i)*px.y*radius))*W[i]+texture(T,v-vec2(0.,float(i)*px.y*radius))*W[i];o=c;}`;
+const FS_HP = `#version 300 es\nprecision highp float;\nuniform sampler2D ORIG,BLUR;in vec2 v;out vec4 o;void main(){o=clamp(texture(ORIG,v)-texture(BLUR,v)+vec4(.5),0.,1.);}`;
+const FS_NM = `#version 300 es\nprecision highp float;
+uniform sampler2D DEPTH,DETAIL;uniform vec2 px;uniform float str,detailMix,sigma;
+in vec2 v;out vec4 o;
+float bilW(float dc,float ds){float d=dc-ds;return exp(-d*d/(sigma*sigma+.0001));}
+float hD(vec2 u){return texture(DEPTH,u).r;}
+float hA(vec2 u){return texture(DETAIL,u).r-.5;}
 void main(){
   float dc=hD(v);
-  // 3×3 Sobel kernel indices:  0(−1,1) 1(0,1) 2(1,1)  3(−1,0) 4(1,0)  5(−1,−1) 6(0,−1) 7(1,−1)
-  vec2 ofs[8]; ofs[0]=px*vec2(-1,1); ofs[1]=px*vec2(0,1); ofs[2]=px*vec2(1,1);
-               ofs[3]=px*vec2(-1,0); ofs[4]=px*vec2(1,0);
-               ofs[5]=px*vec2(-1,-1); ofs[6]=px*vec2(0,-1); ofs[7]=px*vec2(1,-1);
-  float kx[8]; kx[0]=-1.; kx[1]=0.; kx[2]=1.; kx[3]=-2.; kx[4]=2.; kx[5]=-1.; kx[6]=0.; kx[7]=1.;
-  float ky[8]; ky[0]=1.;  ky[1]=2.; ky[2]=1.; ky[3]=0.;  ky[4]=0.; ky[5]=-1.; ky[6]=-2.; ky[7]=-1.;
-  float dx=0.,dy=0., adx=0.,ady=0.;
-  for(int i=0;i<8;i++){
-    float ds=hD(v+ofs[i]); float bw=bilW(dc,ds);
-    float as=hA(v+ofs[i]);
-    dx+=kx[i]*ds*bw; dy+=ky[i]*ds*bw;
-    adx+=kx[i]*as;   ady+=ky[i]*as;
-  }
-  vec3 nD=normalize(vec3(dx*str,dy*str,1.));
-  vec3 nA=normalize(vec3(adx*str*1.5,ady*str*1.5,1.));
-  vec3 n=normalize(vec3(nD.xy+nA.xy*detailMix,nD.z));
-  o=vec4(n*.5+.5,1.);
-}`;
-
-// ── DISPLACEMENT ─────────────────────────────────────────────
-const FS_DISPLACE = `#version 300 es precision highp float;
-uniform sampler2D T; uniform float mid,con,inv;
-in vec2 v; out vec4 o;
-void main(){ float d=texture(T,v).r; d=clamp((d-mid)*con+0.5,0.,1.); d=mix(d,1.-d,inv); o=vec4(d,d,d,1.); }`;
-
-// ── MATERIAL-AWARE ROUGHNESS  (frequency-energy based) ───────
-// localVariance = E[x²]-E[x]² over 5×5 → 미세면 복잡도
-// freqEnergy    = highpass magnitude → 고주파 에너지
-// materialBias  = segmentation class에 따른 조정
-const FS_ROUGH = `#version 300 es precision highp float;
-uniform sampler2D DEPTH,DETAIL,SEGMASK; uniform vec2 px;
-uniform float con,bias,inv,detailMix,matBlend;
-in vec2 v; out vec4 o;
+  vec2 ofs[8];ofs[0]=px*vec2(-1,1);ofs[1]=px*vec2(0,1);ofs[2]=px*vec2(1,1);
+  ofs[3]=px*vec2(-1,0);ofs[4]=px*vec2(1,0);ofs[5]=px*vec2(-1,-1);ofs[6]=px*vec2(0,-1);ofs[7]=px*vec2(1,-1);
+  float kx[8];kx[0]=-1.;kx[1]=0.;kx[2]=1.;kx[3]=-2.;kx[4]=2.;kx[5]=-1.;kx[6]=0.;kx[7]=1.;
+  float ky[8];ky[0]=1.;ky[1]=2.;ky[2]=1.;ky[3]=0.;ky[4]=0.;ky[5]=-1.;ky[6]=-2.;ky[7]=-1.;
+  float dx=0.,dy=0.,adx=0.,ady=0.;
+  for(int i=0;i<8;i++){float ds=hD(v+ofs[i]);float bw=bilW(dc,ds);float as=hA(v+ofs[i]);dx+=kx[i]*ds*bw;dy+=ky[i]*ds*bw;adx+=kx[i]*as;ady+=ky[i]*as;}
+  vec3 nD=normalize(vec3(dx*str,dy*str,1.));vec3 nA=normalize(vec3(adx*str*1.5,ady*str*1.5,1.));
+  vec3 n=normalize(vec3(nD.xy+nA.xy*detailMix,nD.z));o=vec4(n*.5+.5,1.);}`;
+const FS_DISP = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform float mid,con,inv;in vec2 v;out vec4 o;void main(){float d=texture(T,v).r;d=clamp((d-mid)*con+.5,0.,1.);d=mix(d,1.-d,inv);o=vec4(d,d,d,1.);}`;
+const FS_ROUGH = `#version 300 es\nprecision highp float;
+uniform sampler2D DEPTH,DETAIL,SEG;uniform vec2 px;uniform float con,bias,inv,detailMix,matBlend;
+in vec2 v;out vec4 o;
 void main(){
-  // 5×5 local variance on depth
-  float sumD=0.,sumD2=0.;
-  for(int dy=-2;dy<=2;dy++) for(int dx=-2;dx<=2;dx++){
-    float s=texture(DEPTH,v+px*vec2(float(dx),float(dy))).r;
-    sumD+=s; sumD2+=s*s;
-  }
-  sumD/=25.; sumD2/=25.;
-  float localVar=max(sumD2-sumD*sumD,0.)*80.; // amplified variance
-  // Highpass frequency energy
-  vec3 hi=texture(DETAIL,v).rgb-vec3(.5);
-  float freqE=length(hi)*2.;
-  // Blend depth lum, local variance, freq energy
-  float lBase=texture(DEPTH,v).r;
-  float lFreq=mix(lBase, mix(localVar,freqE,.5), detailMix);
-  // Material class bias (R channel: class/4 normalized)
-  float cls=texture(SEGMASK,v).r*4.;
-  float roughPreset=mix(0.75,0.75,0.); // organic default
-  roughPreset=mix(roughPreset,0.38,step(0.5,cls)*step(cls,1.5)); // metal
-  roughPreset=mix(roughPreset,0.86,step(1.5,cls)*step(cls,2.5)); // stone
-  roughPreset=mix(roughPreset,0.92,step(2.5,cls)*step(cls,3.5)); // fabric
-  roughPreset=mix(roughPreset,0.22,step(3.5,cls));               // plastic
-  float l=mix(lFreq,roughPreset,matBlend);
-  l=mix(l,1.-l,inv);
-  o=vec4(vec3(clamp((l-.5)*con+.5+bias,0.,1.)),1.);
-}`;
-
-// ── MATERIAL-AWARE METALLIC ───────────────────────────────────
-const FS_METAL = `#version 300 es precision highp float;
-uniform sampler2D T,SEGMASK; uniform float thr,soft;
-in vec2 v; out vec4 o;
-void main(){
-  float l=texture(T,v).r;
-  float cls=texture(SEGMASK,v).r*4.;
-  // Metal class: threshold 대폭 낮춤 / plastic: 높임
-  float bias=0.;
-  bias=mix(bias,-0.28, step(0.5,cls)*step(cls,1.5)); // metal: easier
-  bias=mix(bias, 0.18, step(3.5,cls));               // plastic: harder
-  float m=smoothstep(thr+bias-soft,thr+bias+soft,l);
-  o=vec4(m,m,m,1.);
-}`;
-
-// ── HBAO (32-sample spiral, depth-range aware) ───────────────
-// Fibonacci spiral → 균일 반구 커버리지
-// Depth range scaling → 깊이 변화가 큰 영역에서 radius 축소
-const FS_AO = `#version 300 es precision highp float;
-uniform sampler2D T; uniform vec2 px; uniform float radius,strength;
-in vec2 v; out vec4 o;
-const float GOLDEN=2.3999632; // golden angle rad
-const int SAMPLES=32;
-void main(){
-  float dc=texture(T,v).r, occ=0.;
-  // Local depth range (5×5) → adaptive radius
-  float dMin=1.,dMax=0.;
-  for(int dy=-2;dy<=2;dy++) for(int dx=-2;dx<=2;dx++){
-    float s=texture(T,v+px*vec2(float(dx),float(dy))*4.).r;
-    dMin=min(dMin,s); dMax=max(dMax,s);
-  }
-  float dRange=max(dMax-dMin,0.01);
-  float adaptR=radius/dRange; // narrower radius where depth varies a lot
-  for(int i=0;i<SAMPLES;i++){
-    float r=sqrt(float(i+1)/float(SAMPLES));
-    float theta=float(i)*GOLDEN;
-    vec2 off=vec2(cos(theta),sin(theta))*px*min(adaptR,radius)*80.*r;
-    float ds=texture(T,v+off).r;
-    float diff=dc-ds;
-    // Cosine-weighted: nearby samples count more
-    float cosW=(1.-r)*.7+.3;
-    occ+=clamp(diff*8.,0.,1.)*cosW;
-  }
-  float ao=clamp(1.-(occ/float(SAMPLES)*2.)*strength,0.,1.);
-  o=vec4(ao,ao,ao,1.);
-}`;
-
-// ── MULTI-SCALE CURVATURE ─────────────────────────────────────
-// 3가지 스케일에서 법선 발산 계산 → 블렌드
-// Fine(1px): 미세 엣지 / Medium(4px): 중간 디테일 / Coarse(12px): 큰 형태
-const FS_CURV = `#version 300 es precision highp float;
-uniform sampler2D NORMAL; uniform vec2 px; uniform float scale;
-in vec2 v; out vec4 o;
-float curvAtScale(float s){
-  vec3 n=normalize(texture(NORMAL,v).rgb*2.-1.);
-  vec3 nr=normalize(texture(NORMAL,v+vec2(px.x*s,0.)).rgb*2.-1.);
-  vec3 nu=normalize(texture(NORMAL,v+vec2(0.,px.y*s)).rgb*2.-1.);
-  vec3 nl=normalize(texture(NORMAL,v-vec2(px.x*s,0.)).rgb*2.-1.);
-  vec3 nd=normalize(texture(NORMAL,v-vec2(0.,px.y*s)).rgb*2.-1.);
-  float div=(dot(n,nr)+dot(n,nu)+dot(n,nl)+dot(n,nd))/4.-1.;
-  return clamp(-div*scale*3.+.5,0.,1.);
-}
-void main(){
-  float cf=curvAtScale(1.);
-  float cm=curvAtScale(4.);
-  float cc=curvAtScale(12.);
-  // Fine detail emphasized for edge wear
-  float c=cf*.50+cm*.30+cc*.20;
-  o=vec4(c,c,c,1.);
-}`;
-
-// ── ORM CHANNEL PACK  (Unreal/Unity ready) ───────────────────
-// R: AO   G: Roughness   B: Metallic
-const FS_ORM = `#version 300 es precision highp float;
-uniform sampler2D AO,ROUGH,METAL; in vec2 v; out vec4 o;
-void main(){
-  float ao=texture(AO,v).r;
-  float r=texture(ROUGH,v).r;
-  float m=texture(METAL,v).r;
-  o=vec4(ao,r,m,1.);
-}`;
+  float sd=0.,sd2=0.;for(int dy=-2;dy<=2;dy++)for(int dx=-2;dx<=2;dx++){float s=texture(DEPTH,v+px*vec2(float(dx),float(dy))).r;sd+=s;sd2+=s*s;}
+  sd/=25.;sd2/=25.;float lv=max(sd2-sd*sd,0.)*80.;
+  float fe=length(texture(DETAIL,v).rgb-vec3(.5))*2.;
+  float lb=texture(DEPTH,v).r;float l=mix(lb,mix(lv,fe,.5),detailMix);
+  float cls=texture(SEG,v).r*4.;
+  float rp=.75;rp=mix(rp,.38,step(.5,cls)*step(cls,1.5));rp=mix(rp,.86,step(1.5,cls)*step(cls,2.5));rp=mix(rp,.92,step(2.5,cls)*step(cls,3.5));rp=mix(rp,.22,step(3.5,cls));
+  l=mix(l,rp,matBlend);l=mix(l,1.-l,inv);o=vec4(vec3(clamp((l-.5)*con+.5+bias,0.,1.)),1.);}`;
+const FS_METAL = `#version 300 es\nprecision highp float;\nuniform sampler2D T,SEG;uniform float thr,soft;in vec2 v;out vec4 o;void main(){float l=texture(T,v).r;float cls=texture(SEG,v).r*4.;float bias=0.;bias=mix(bias,-.28,step(.5,cls)*step(cls,1.5));bias=mix(bias,.18,step(3.5,cls));float m=smoothstep(thr+bias-soft,thr+bias+soft,l);o=vec4(m,m,m,1.);}`;
+const FS_AO = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius,strength;in vec2 v;out vec4 o;const float G=2.3999632;const int S=32;void main(){float dc=texture(T,v).r,occ=0.,dMn=1.,dMx=0.;for(int dy=-2;dy<=2;dy++)for(int dx=-2;dx<=2;dx++){float s=texture(T,v+px*vec2(float(dx),float(dy))*4.).r;dMn=min(dMn,s);dMx=max(dMx,s);}float dr=max(dMx-dMn,.01),ar=radius/dr;for(int i=0;i<S;i++){float r=sqrt(float(i+1)/float(S)),th=float(i)*G;vec2 off=vec2(cos(th),sin(th))*px*min(ar,radius)*80.*r;occ+=clamp((dc-texture(T,v+off).r)*8.,0.,1.)*(1.-r)*.7+.3*(1.-r);}float ao=clamp(1.-(occ/float(S)*2.)*strength,0.,1.);o=vec4(ao,ao,ao,1.);}`;
+const FS_CURV = `#version 300 es\nprecision highp float;\nuniform sampler2D NM;uniform vec2 px;uniform float scale;in vec2 v;out vec4 o;float cs(float s){vec3 n=normalize(texture(NM,v).rgb*2.-1.);float d=0.;vec2[4] ds=vec2[4](vec2(px.x*s,0.),vec2(0.,px.y*s),vec2(-px.x*s,0.),vec2(0.,-px.y*s));for(int i=0;i<4;i++)d+=dot(n,normalize(texture(NM,v+ds[i]).rgb*2.-1.));return clamp(-(d/4.-1.)*scale*3.+.5,0.,1.);}void main(){float c=cs(1.)*.5+cs(4.)*.3+cs(12.)*.2;o=vec4(c,c,c,1.);}`;
+const FS_ORM = `#version 300 es\nprecision highp float;\nuniform sampler2D AO,RO,ME;in vec2 v;out vec4 o;void main(){o=vec4(texture(AO,v).r,texture(RO,v).r,texture(ME,v).r,1.);}`;
 
 /* ═══════════════════════════════════════════════════════════════
-   TILED PIPELINE
-   resolutions ≤ 2048 → single pass
-   resolutions > 2048 → TILE(2048) × N tiles, PAD(32) overlap
-
-   핵심:
-   - WebGL context를 타일마다 재사용 (VRAM 절약)
-   - 타일 사이 PAD 32px: blur/Sobel 커널 경계 artifact 제거
-   - 마지막 타일은 실제 이미지 크기만큼만 output에 복사
+   WebGL2 PIPELINE
 ═══════════════════════════════════════════════════════════════ */
-const TILE_SIZE = 2048;
-const TILE_PAD = 32;
-
-function buildGLContext(W, H) {
+const TILE = 2048,
+  PAD = 32;
+function mkGL(W, H) {
   const c = document.createElement("canvas");
   c.width = W;
   c.height = H;
   const gl = c.getContext("webgl2", { preserveDrawingBuffer: true });
   if (!gl) return null;
-
-  const mkProg = (fSrc) => {
+  const mp = (fs) => {
     const p = gl.createProgram();
     [
       [gl.VERTEX_SHADER, VS],
-      [gl.FRAGMENT_SHADER, fSrc],
-    ].forEach(([t, src]) => {
+      [gl.FRAGMENT_SHADER, fs],
+    ].forEach(([t, s]) => {
       const sh = gl.createShader(t);
-      gl.shaderSource(sh, src);
+      gl.shaderSource(sh, s);
       gl.compileShader(sh);
       gl.attachShader(p, sh);
     });
     gl.linkProgram(p);
     return p;
   };
-
   const P = {
-    pass: mkProg(FS_PASS),
-    blurH: mkProg(FS_BLUR_H),
-    blurV: mkProg(FS_BLUR_V),
-    highpass: mkProg(FS_HIGHPASS),
-    normal: mkProg(FS_NORMAL),
-    displace: mkProg(FS_DISPLACE),
-    rough: mkProg(FS_ROUGH),
-    metal: mkProg(FS_METAL),
-    ao: mkProg(FS_AO),
-    curv: mkProg(FS_CURV),
-    orm: mkProg(FS_ORM),
+    pass: mp(FS_PASS),
+    bh: mp(FS_BH),
+    bv: mp(FS_BV),
+    hp: mp(FS_HP),
+    nm: mp(FS_NM),
+    disp: mp(FS_DISP),
+    rough: mp(FS_ROUGH),
+    metal: mp(FS_METAL),
+    ao: mp(FS_AO),
+    curv: mp(FS_CURV),
+    orm: mp(FS_ORM),
   };
-
-  const qBuf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, qBuf);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb);
   gl.bufferData(
     gl.ARRAY_BUFFER,
     new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]),
     gl.STATIC_DRAW,
   );
-
-  const mkTex = (src) => {
+  const mkt = (src) => {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
     if (src)
@@ -499,15 +286,13 @@ function buildGLContext(W, H) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     return t;
   };
-
-  const upTex = (t, src) => {
+  const upt = (t, s) => {
     gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, s);
   };
-
-  const mkFBO = (t) => {
-    const fbo = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  const mkf = (t) => {
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
     gl.framebufferTexture2D(
       gl.FRAMEBUFFER,
       gl.COLOR_ATTACHMENT0,
@@ -516,107 +301,87 @@ function buildGLContext(W, H) {
       0,
     );
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    return fbo;
+    return f;
   };
-
-  const exec = (prog, fbo, bindings, uniforms) => {
+  const exec = (prog, fbo, binds, uns) => {
     gl.useProgram(prog);
     const a = gl.getAttribLocation(prog, "a");
     gl.enableVertexAttribArray(a);
-    gl.bindBuffer(gl.ARRAY_BUFFER, qBuf);
+    gl.bindBuffer(gl.ARRAY_BUFFER, qb);
     gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
-    bindings.forEach(([name, tex], i) => {
+    binds.forEach(([n, t], i) => {
       gl.activeTexture(gl.TEXTURE0 + i);
-      gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.uniform1i(gl.getUniformLocation(prog, name), i);
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.uniform1i(gl.getUniformLocation(prog, n), i);
     });
-    for (const [k, val] of Object.entries(uniforms)) {
+    for (const [k, v] of Object.entries(uns)) {
       const u = gl.getUniformLocation(prog, k);
       if (!u) continue;
-      Array.isArray(val) ? gl.uniform2fv(u, val) : gl.uniform1f(u, val);
+      Array.isArray(v) ? gl.uniform2fv(u, v) : gl.uniform1f(u, v);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo ?? null);
     gl.viewport(0, 0, W, H);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   };
-
-  // Pre-allocate FBO pool
   const T = {
-    alb: mkTex(null),
-    dep: mkTex(null),
-    seg: mkTex(null),
-    bh: mkTex(null),
-    bv: mkTex(null),
-    hi: mkTex(null),
-    norm: mkTex(null),
-    ao: mkTex(null),
-    rough: mkTex(null),
-    metal: mkTex(null),
-    displace: mkTex(null),
+    a: mkt(null),
+    d: mkt(null),
+    s: mkt(null),
+    bh: mkt(null),
+    bv: mkt(null),
+    hi: mkt(null),
+    nm: mkt(null),
+    ao: mkt(null),
+    ro: mkt(null),
+    me: mkt(null),
+    di: mkt(null),
   };
   const F = {};
-  for (const k of Object.keys(T)) F[k] = mkFBO(T[k]);
-
-  return { gl, c, P, T, F, exec, upTex };
+  for (const k of Object.keys(T)) F[k] = mkf(T[k]);
+  return { gl, c, P, T, F, exec, upt };
 }
-
-function toRGBA(src, W, H) {
+function rgba(src, W, H) {
   const c = document.createElement("canvas");
   c.width = W;
   c.height = H;
   c.getContext("2d", { willReadFrequently: true }).drawImage(src, 0, 0, W, H);
   return c;
 }
-
-// Single tile pass → returns output canvas
-function runTilePass(ctx, tileAlb, tileDep, tileSeg, W, H, s) {
-  const { gl, c, P, T, F, exec, upTex } = ctx;
+function runTile(ctx, albC, depC, segC, W, H, s) {
+  const { gl, c, P, T, F, exec, upt } = ctx;
   const px = [1 / W, 1 / H];
-
-  upTex(T.alb, tileAlb);
-  upTex(T.dep, tileDep);
-  upTex(T.seg, tileSeg);
-
-  // Frequency separation
-  exec(P.blurH, F.bh, [["T", T.alb]], { px, radius: s.blurRadius });
-  exec(P.blurV, F.bv, [["T", T.bh]], { px, radius: s.blurRadius });
+  upt(T.a, albC);
+  upt(T.d, depC);
+  upt(T.s, segC);
+  exec(P.bh, F.bh, [["T", T.a]], { px, radius: s.blurRadius });
+  exec(P.bv, F.bv, [["T", T.bh]], { px, radius: s.blurRadius });
   exec(
-    P.highpass,
+    P.hp,
     F.hi,
     [
-      ["ORIG", T.alb],
+      ["ORIG", T.a],
       ["BLUR", T.bv],
     ],
     {},
   );
-
-  // Normal → FBO (Curvature reads this)
   exec(
-    P.normal,
-    F.norm,
+    P.nm,
+    F.nm,
     [
-      ["DEPTH", T.dep],
+      ["DEPTH", T.d],
       ["DETAIL", T.hi],
     ],
     { px, str: s.normalStr, detailMix: s.detailMix, sigma: s.normalSigma },
   );
-
-  // AO (uses depth)
-  exec(P.ao, F.ao, [["T", T.dep]], {
-    px,
-    radius: s.aoRadius,
-    strength: s.aoStr,
-  });
-
-  // Roughness (material-aware)
+  exec(P.ao, F.ao, [["T", T.d]], { px, radius: s.aoRadius, strength: s.aoStr });
   exec(
     P.rough,
-    F.rough,
+    F.ro,
     [
-      ["DEPTH", T.dep],
+      ["DEPTH", T.d],
       ["DETAIL", T.hi],
-      ["SEGMASK", T.seg],
+      ["SEG", T.s],
     ],
     {
       px,
@@ -627,111 +392,83 @@ function runTilePass(ctx, tileAlb, tileDep, tileSeg, W, H, s) {
       matBlend: s.matBlend,
     },
   );
-
-  // Metallic (material-aware)
   exec(
     P.metal,
-    F.metal,
+    F.me,
     [
-      ["T", T.dep],
-      ["SEGMASK", T.seg],
+      ["T", T.d],
+      ["SEG", T.s],
     ],
     { thr: s.metalThr, soft: s.metalSoft },
   );
-
-  // Displacement
-  exec(P.displace, F.displace, [["T", T.dep]], {
+  exec(P.disp, F.di, [["T", T.d]], {
     mid: s.dispMid,
     con: s.dispCon,
     inv: s.dispInv ? 1 : 0,
   });
-
-  // Snap all to output canvas (sequential: each snap overwrites default FB)
-  const snap = (prog, bindings, uniforms) => {
-    exec(prog, null, bindings, uniforms);
+  const snap = (prog, binds, uns) => {
+    exec(prog, null, binds, uns);
     return c.toDataURL("image/png");
   };
-
   return {
-    normal: snap(P.pass, [["T", T.norm]], {}),
-    displacement: snap(P.displace, [["T", T.dep]], {
+    normal: snap(P.pass, [["T", T.nm]], {}),
+    displacement: snap(P.disp, [["T", T.d]], {
       mid: s.dispMid,
       con: s.dispCon,
       inv: s.dispInv ? 1 : 0,
     }),
-    roughness: snap(P.pass, [["T", T.rough]], {}),
-    metallic: snap(P.pass, [["T", T.metal]], {}),
+    roughness: snap(P.pass, [["T", T.ro]], {}),
+    metallic: snap(P.pass, [["T", T.me]], {}),
     ao: snap(P.pass, [["T", T.ao]], {}),
-    curvature: snap(P.curv, [["NORMAL", T.norm]], { px, scale: s.curvScale }),
+    curvature: snap(P.curv, [["NM", T.nm]], { px, scale: s.curvScale }),
     orm: snap(
       P.orm,
       [
         ["AO", T.ao],
-        ["ROUGH", T.rough],
-        ["METAL", T.metal],
+        ["RO", T.ro],
+        ["ME", T.me],
       ],
       {},
     ),
   };
 }
-
-async function generateMaps(
-  albedoImg,
-  depthCvs,
-  segMaskCvs,
-  s,
-  resolution,
-  onProgress,
-) {
-  const sc = Math.min(
-    1,
-    resolution / Math.max(albedoImg.naturalWidth, albedoImg.naturalHeight),
-  );
-  const W = Math.round(albedoImg.naturalWidth * sc);
-  const H = Math.round(albedoImg.naturalHeight * sc);
-
-  // Neutral seg mask if not provided
-  const neutralSeg =
-    segMaskCvs ||
+async function generateMaps(img, depCvs, segCvs, s, res, onProg) {
+  const sc = Math.min(1, res / Math.max(img.naturalWidth, img.naturalHeight));
+  const W = Math.round(img.naturalWidth * sc),
+    H = Math.round(img.naturalHeight * sc);
+  const neutral =
+    segCvs ||
     (() => {
       const c = document.createElement("canvas");
       c.width = c.height = 64;
-      const ctx = c.getContext("2d");
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, 0, 64, 64);
+      c.getContext("2d").fillRect(0, 0, 64, 64);
       return c;
     })();
-
-  const useTiled = W > TILE_SIZE || H > TILE_SIZE;
-
-  if (!useTiled) {
-    // ── Single pass ──────────────────────────────────────────
-    const glCtx = buildGLContext(W, H);
-    if (!glCtx) return null;
-    const albRGBA = toRGBA(albedoImg, W, H);
-    const depRGBA = toRGBA(depthCvs, W, H);
-    const segRGBA = toRGBA(neutralSeg, W, H);
-    onProgress?.(1, 1);
-    return runTilePass(glCtx, albRGBA, depRGBA, segRGBA, W, H, s);
+  if (W <= TILE && H <= TILE) {
+    const ctx = mkGL(W, H);
+    if (!ctx) return null;
+    onProg?.(1, 1);
+    return runTile(
+      ctx,
+      rgba(img, W, H),
+      rgba(depCvs, W, H),
+      rgba(neutral, W, H),
+      W,
+      H,
+      s,
+    );
   }
-
-  // ── Tiled pass ───────────────────────────────────────────
-  const TW = TILE_SIZE + 2 * TILE_PAD;
-  const TH = TILE_SIZE + 2 * TILE_PAD;
-  const glCtx = buildGLContext(TW, TH);
-  if (!glCtx) return null;
-
-  const tilesX = Math.ceil(W / TILE_SIZE);
-  const tilesY = Math.ceil(H / TILE_SIZE);
-  const totalTiles = tilesX * tilesY;
-
-  // Create full-res scaled source canvases once
-  const fullAlb = toRGBA(albedoImg, W, H);
-  const fullDep = toRGBA(depthCvs, W, H);
-  const fullSeg = toRGBA(neutralSeg, W, H);
-
-  // Output compositing canvases
-  const outKeys = [
+  const TW = TILE + 2 * PAD,
+    TH = TILE + 2 * PAD;
+  const ctx = mkGL(TW, TH);
+  if (!ctx) return null;
+  const txA = Math.ceil(W / TILE),
+    tyA = Math.ceil(H / TILE),
+    tot = txA * tyA;
+  const fAlb = rgba(img, W, H),
+    fDep = rgba(depCvs, W, H),
+    fSeg = rgba(neutral, W, H);
+  const keys = [
     "normal",
     "displacement",
     "roughness",
@@ -740,230 +477,232 @@ async function generateMaps(
     "curvature",
     "orm",
   ];
-  const outCanvas = {};
-  for (const k of outKeys) {
+  const outs = {};
+  for (const k of keys) {
     const c = document.createElement("canvas");
     c.width = W;
     c.height = H;
-    outCanvas[k] = c;
+    outs[k] = c;
   }
-
-  // Tile canvas for source extraction
-  const tAlbC = document.createElement("canvas");
-  tAlbC.width = tAlbC.height = TW;
-  const tDepC = document.createElement("canvas");
-  tDepC.width = tDepC.height = TH;
-  const tSegC = document.createElement("canvas");
-  tSegC.width = tSegC.height = TH;
-
-  let tileNum = 0;
-  for (let ty = 0; ty < tilesY; ty++) {
-    for (let tx = 0; tx < tilesX; tx++) {
-      const offX = -(tx * TILE_SIZE - TILE_PAD);
-      const offY = -(ty * TILE_SIZE - TILE_PAD);
-
+  const tA = document.createElement("canvas");
+  tA.width = tA.height = TW;
+  const tD = document.createElement("canvas");
+  tD.width = tD.height = TH;
+  const tS = document.createElement("canvas");
+  tS.width = tS.height = TH;
+  let tn = 0;
+  for (let ty = 0; ty < tyA; ty++)
+    for (let tx = 0; tx < txA; tx++) {
+      const ox = -(tx * TILE - PAD),
+        oy = -(ty * TILE - PAD);
       for (const [tc, src] of [
-        [tAlbC, fullAlb],
-        [tDepC, fullDep],
-        [tSegC, fullSeg],
+        [tA, fAlb],
+        [tD, fDep],
+        [tS, fSeg],
       ]) {
-        const ctx = tc.getContext("2d", { willReadFrequently: true });
-        ctx.fillStyle = "#808080";
-        ctx.fillRect(0, 0, TW, TH);
-        ctx.drawImage(src, offX, offY);
+        const c = tc.getContext("2d", { willReadFrequently: true });
+        c.fillStyle = "#808080";
+        c.fillRect(0, 0, TW, TH);
+        c.drawImage(src, ox, oy);
       }
-
-      const result = runTilePass(glCtx, tAlbC, tDepC, tSegC, TW, TH, s);
-
-      // Composite center region (skip padding) to output
-      const copyW = Math.min(TILE_SIZE, W - tx * TILE_SIZE);
-      const copyH = Math.min(TILE_SIZE, H - ty * TILE_SIZE);
-      const dstX = tx * TILE_SIZE;
-      const dstY = ty * TILE_SIZE;
-
-      for (const k of outKeys) {
-        const tmpImg = new Image();
-        tmpImg.src = result[k];
-        await new Promise((r) => {
-          tmpImg.onload = r;
-          tmpImg.onerror = r;
+      const r = runTile(ctx, tA, tD, tS, TW, TH, s);
+      const cW = Math.min(TILE, W - tx * TILE),
+        cH = Math.min(TILE, H - ty * TILE),
+        dX = tx * TILE,
+        dY = ty * TILE;
+      for (const k of keys) {
+        const ti = new Image();
+        ti.src = r[k];
+        await new Promise((resolve) => {
+          ti.onload = resolve;
+          ti.onerror = resolve;
         });
-        outCanvas[k]
+        outs[k]
           .getContext("2d")
-          .drawImage(
-            tmpImg,
-            TILE_PAD,
-            TILE_PAD,
-            copyW,
-            copyH,
-            dstX,
-            dstY,
-            copyW,
-            copyH,
-          );
+          .drawImage(ti, PAD, PAD, cW, cH, dX, dY, cW, cH);
       }
-
-      tileNum++;
-      onProgress?.(tileNum, totalTiles);
-      // Yield to UI thread between tiles
-      await new Promise((r) => setTimeout(r, 0));
+      tn++;
+      onProg?.(tn, tot);
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
-  }
-
   const out = {};
-  for (const k of outKeys) out[k] = outCanvas[k].toDataURL("image/png");
+  for (const k of keys) out[k] = outs[k].toDataURL("image/png");
   return out;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   AUTO-ANALYZE  (albedo 통계 → PBR 파라미터 자동 제안)
+   AUTO-ANALYZE
 ═══════════════════════════════════════════════════════════════ */
-function analyzeAlbedo(imgEl) {
-  const S = 128;
-  const c = document.createElement("canvas");
+function analyzeAlbedo(img) {
+  const S = 128,
+    c = document.createElement("canvas");
   c.width = c.height = S;
   const ctx = c.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(imgEl, 0, 0, S, S);
-  const px = ctx.getImageData(0, 0, S, S).data;
-  const n = px.length / 4;
+  ctx.drawImage(img, 0, 0, S, S);
+  const px = ctx.getImageData(0, 0, S, S).data,
+    n = px.length / 4;
   let ss = 0,
     sl = 0,
-    lumArr = [];
+    la = [];
   for (let i = 0; i < px.length; i += 4) {
     const r = px[i] / 255,
       g = px[i + 1] / 255,
       b = px[i + 2] / 255;
     const mx = Math.max(r, g, b),
-      mn = Math.min(r, g, b);
-    const l = 0.299 * r + 0.587 * g + 0.114 * b;
+      mn = Math.min(r, g, b),
+      l = 0.299 * r + 0.587 * g + 0.114 * b;
     ss += mx === 0 ? 0 : (mx - mn) / mx;
     sl += l;
-    lumArr.push(l);
+    la.push(l);
   }
-  const avgSat = ss / n,
-    avgLum = sl / n;
-  const lumVar = lumArr.reduce((a, l) => a + (l - avgLum) ** 2, 0) / n;
+  const aS = ss / n,
+    aL = sl / n,
+    lv = la.reduce((a, l) => a + (l - aL) ** 2, 0) / n;
   return {
-    metalThr: avgSat < 0.12 ? 0.52 : avgSat < 0.25 ? 0.68 : 0.84,
-    roughCon: Math.min(5.5, 1.5 + lumVar * 40),
-    roughBias: lumVar > 0.04 ? -0.05 : 0.05,
-    detailMix: Math.min(0.8, 0.2 + lumVar * 18),
-    roughDetailMix: Math.min(0.8, 0.3 + lumVar * 14),
-    dispMid: Math.max(0.3, Math.min(0.7, avgLum)),
-    matBlend: Math.min(0.5, avgSat < 0.15 ? 0.4 : 0.15),
+    metalThr: aS < 0.12 ? 0.52 : aS < 0.25 ? 0.68 : 0.84,
+    roughCon: Math.min(5.5, 1.5 + lv * 40),
+    roughBias: lv > 0.04 ? -0.05 : 0.05,
+    detailMix: Math.min(0.8, 0.2 + lv * 18),
+    roughDetailMix: Math.min(0.8, 0.3 + lv * 14),
+    dispMid: Math.max(0.3, Math.min(0.7, aL)),
+    matBlend: Math.min(0.5, aS < 0.15 ? 0.4 : 0.15),
   };
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   ZIP EXPORT
+   ZIP
 ═══════════════════════════════════════════════════════════════ */
-async function exportZip(maps, resolution) {
-  const zip = new JSZip();
-  const f = zip.folder(`unarrived_maps_${resolution}px`);
+async function doZip(maps, res) {
+  const z = new JSZip(),
+    f = z.folder(`unarrived_${res}px`);
   await Promise.all(
     Object.entries(maps).map(async ([k, u]) => {
-      f.file(`unarrived_${k}.png`, await (await fetch(u)).blob());
+      f.file(`${k}.png`, await (await fetch(u)).blob());
     }),
   );
-  const b = await zip.generateAsync({ type: "blob" });
+  const b = await z.generateAsync({ type: "blob" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(b);
-  a.download = `unarrived_maps_${resolution}px.zip`;
+  a.download = `unarrived_${res}px.zip`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   CONSTANTS
+   DESIGN TOKENS
 ═══════════════════════════════════════════════════════════════ */
-const DEF = {
-  normalStr: 3.0,
-  detailMix: 0.4,
-  normalSigma: 0.05,
-  dispMid: 0.5,
-  dispCon: 2.0,
-  dispInv: false,
-  roughCon: 2.0,
-  roughBias: 0.0,
-  roughInv: false,
-  roughDetailMix: 0.5,
-  metalThr: 0.75,
-  metalSoft: 0.1,
-  blurRadius: 6.0,
-  aoRadius: 0.8,
-  aoStr: 1.2,
-  curvScale: 1.0,
-  matBlend: 0.25, // 0=heuristic only  1=class preset only
+const C = {
+  bg: "#0e0f14",
+  sidebar: "#13141a",
+  panel: "#1a1b22",
+  border: "#2a2b38",
+  borderHi: "#3a3b50",
+  text: "#c8cad8",
+  textDim: "#6a6c80",
+  textFaint: "#3a3c50",
+  accent: "#e8a020",
+  accentDim: "#a06010",
+  blue: "#5090e8",
+  green: "#40c060",
+  purple: "#9060d0",
+  teal: "#30b898",
+  red: "#c04030",
+  yellow: "#d0b020",
+  pink: "#c04090",
 };
 
-const MAPS_GRID = [
+const MAPS_DEF = [
   {
     key: "normal",
-    label: "NORMAL",
-    color: "#4a90e2",
-    hint: "Bilateral depth+highpass",
+    label: "Normal Map",
+    color: C.blue,
+    hint: "Bilateral depth + highpass blend",
   },
   {
     key: "displacement",
-    label: "DISPLACEMENT",
-    color: "#e09a30",
-    hint: "Mid-point height field",
+    label: "Displacement",
+    color: C.accent,
+    hint: "AI depth height field",
   },
   {
     key: "roughness",
-    label: "ROUGHNESS",
-    color: "#a065d0",
-    hint: "Freq-energy + material",
+    label: "Roughness",
+    color: C.purple,
+    hint: "Frequency + material class",
   },
   {
     key: "metallic",
-    label: "METALLIC",
-    color: "#20b89a",
-    hint: "Material-class threshold",
+    label: "Metallic",
+    color: C.teal,
+    hint: "Material-aware threshold",
   },
-  { key: "ao", label: "AO", color: "#c84b31", hint: "HBAO 32-sample spiral" },
+  {
+    key: "ao",
+    label: "Ambient Occ.",
+    color: C.red,
+    hint: "HBAO 32-sample spiral",
+  },
   {
     key: "curvature",
-    label: "CURVATURE",
-    color: "#f0c040",
+    label: "Curvature",
+    color: C.yellow,
     hint: "Multi-scale edge wear",
   },
 ];
 const MAPS_EXTRA = [
   {
     key: "orm",
-    label: "ORM PACK",
-    color: "#60a0d0",
-    hint: "R:AO G:Rough B:Metal (UE/Unity)",
+    label: "ORM Pack",
+    color: C.blue,
+    hint: "R:AO  G:Rough  B:Metal  (UE/Unity)",
   },
 ];
-const ALL_MAPS = [...MAPS_GRID, ...MAPS_EXTRA];
+const ALL_MAPS = [...MAPS_DEF, ...MAPS_EXTRA];
 
-const AI_STEPS = {
-  idle: { label: "IDLE", color: "#1e1e35" },
-  loading: { label: "LOADING DEPTH MODEL…", color: "#60a5fa" },
-  inferring: { label: "DEPTH INFERENCE…", color: "#22c55e" },
-  segloading: { label: "LOADING SEGMENTER…", color: "#a060f0" },
-  seginfer: { label: "MATERIAL ANALYSIS…", color: "#d060c0" },
-  segmask: { label: "BUILDING MAT MASK…", color: "#d060c0" },
-  generating: { label: "BUILDING MAPS…", color: "#e8a020" },
-  tiling: { label: "TILING…", color: "#e8a020" },
-  analyzing: { label: "ANALYZING IMAGE…", color: "#d06090" },
-  ready: { label: "READY", color: "#252540" },
-  error: { label: "ERROR", color: "#ef4444" },
+const STEPS = {
+  idle: { label: "Idle", dot: C.textFaint },
+  loading: { label: "Loading depth model…", dot: C.blue },
+  inferring: { label: "Running depth AI…", dot: C.green },
+  segload: { label: "Loading segmenter…", dot: C.purple },
+  seginfer: { label: "Analyzing materials…", dot: C.pink },
+  segmask: { label: "Building material mask…", dot: C.pink },
+  generating: { label: "Generating PBR maps…", dot: C.accent },
+  tiling: { label: "Tiling…", dot: C.accent },
+  analyzing: { label: "Analyzing albedo…", dot: C.pink },
+  ready: { label: "Ready", dot: C.green },
+  error: { label: "Error — check console", dot: C.red },
 };
 
 const SHAPES = [
-  { key: "sphere", label: "SPH" },
-  { key: "plane", label: "PLN" },
-  { key: "torus", label: "TOR" },
+  { k: "sphere", l: "Sphere" },
+  { k: "plane", l: "Plane" },
+  { k: "torus", l: "Torus" },
 ];
-const HDRI_KEYS = Object.keys(HDRI_PRESETS);
 const ALL_RES = [512, 1024, 2048, 4096, 8192];
 
 /* ═══════════════════════════════════════════════════════════════
    APP
 ═══════════════════════════════════════════════════════════════ */
+const DEF = {
+  normalStr: 3,
+  detailMix: 0.4,
+  normalSigma: 0.05,
+  dispMid: 0.5,
+  dispCon: 2,
+  dispInv: false,
+  roughCon: 2,
+  roughBias: 0,
+  roughInv: false,
+  roughDetailMix: 0.5,
+  metalThr: 0.75,
+  metalSoft: 0.1,
+  blurRadius: 6,
+  aoRadius: 0.8,
+  aoStr: 1.2,
+  curvScale: 1,
+  matBlend: 0.25,
+};
+
 export default function App() {
   const [srcURL, setSrcURL] = useState(null);
   const [maps, setMaps] = useState(null);
@@ -974,207 +713,258 @@ export default function App() {
   const [hovered, setHovered] = useState(null);
   const [imgInfo, setImgInfo] = useState(null);
   const [aiStep, setAiStep] = useState("idle");
-  const [tileProgress, setTileProgress] = useState(null); // {cur,total}
-  const [qualityMode, setQualityMode] = useState(false); // false=fast, true=quality
-  const [previewShape, setPreviewShape] = useState("sphere");
-  const [tileCount, setTileCount] = useState(1);
-  const [resolution, setResolution] = useState(1024);
-  const [hdriPreset, setHdriPreset] = useState("studio");
-  const [gpuInfo, setGpuInfo] = useState({
-    maxTex: 4096,
-    renderer: "Querying…",
-  });
-  const [analyzeHint, setAnalyzeHint] = useState(null);
+  const [tileProg, setTileProg] = useState(null);
+  const [quality, setQuality] = useState(false);
+  const [shape, setShape] = useState("sphere");
+  const [tileRep, setTileRep] = useState(1);
+  const [res, setRes] = useState(1024);
+  const [hdri, setHdri] = useState("studio");
+  const [gpu, setGpu] = useState({ maxTex: 4096, renderer: "Querying…" });
+  const [hint, setHint] = useState(null);
 
-  const canvasRef = useRef(null);
-  const imgRef = useRef(null);
-  const depthRef = useRef(null);
-  const segMaskRef = useRef(null);
-  const settingRef = useRef(settings);
-  const resRef = useRef(resolution);
-  const three = useRef({});
-  const orbit = useRef({ on: false, x: 0, y: 0 });
-  const token = useRef(0);
+  const cvs = useRef(null),
+    imgR = useRef(null),
+    depR = useRef(null),
+    segR = useRef(null);
+  const setR = useRef(settings),
+    resR = useRef(res),
+    threeR = useRef({}),
+    orbit = useRef({ on: false, x: 0, y: 0 }),
+    tok = useRef(0);
 
   useEffect(() => {
-    settingRef.current = settings;
+    setR.current = settings;
   }, [settings]);
   useEffect(() => {
-    resRef.current = resolution;
-  }, [resolution]);
+    resR.current = res;
+  }, [res]);
   useEffect(() => {
-    setGpuInfo(queryGPU());
+    setGpu(queryGPU());
   }, []);
 
-  /* ── Load image & AI inference ─────────────────────────── */
   const loadFile = useCallback(
     (file) => {
       if (!file?.type.startsWith("image/")) return;
-      const tid = ++token.current;
-      const url = URL.createObjectURL(file);
-      const img = new Image();
-
+      const tid = ++tok.current;
+      const url = URL.createObjectURL(file),
+        img = new Image();
       img.onload = async () => {
-        if (tid !== token.current) return;
-        imgRef.current = img;
+        if (tid !== tok.current) return;
+        imgR.current = img;
         setSrcURL(url);
         setImgInfo({ w: img.naturalWidth, h: img.naturalHeight });
         setMaps(null);
-        depthRef.current = null;
-        segMaskRef.current = null;
-        setAnalyzeHint(null);
-        setTileProgress(null);
+        depR.current = null;
+        segR.current = null;
+        setHint(null);
+        setTileProg(null);
         setProc(true);
-
         try {
           setAiStep("loading");
-          const depEst = await getDepth();
-          if (tid !== token.current) return;
-
+          const dep = await getDepth();
+          if (tid !== tok.current) return;
           setAiStep("inferring");
-          const depResult = await depEst(url);
-          if (tid !== token.current) return;
-          depthRef.current = depResult.depth.toCanvas();
-
-          // Quality mode: run segmentation
-          if (qualityMode) {
-            setAiStep("segloading");
-            const seg = await getSegmenter();
-            if (tid !== token.current) return;
-
+          const dr = await dep(url);
+          if (tid !== tok.current) return;
+          depR.current = dr.depth.toCanvas();
+          if (quality) {
+            setAiStep("segload");
+            const sg = await getSeg();
+            if (tid !== tok.current) return;
             setAiStep("seginfer");
-            const segResult = await seg(url);
-            if (tid !== token.current) return;
-
+            const sr = await sg(url);
+            if (tid !== tok.current) return;
             setAiStep("segmask");
-            segMaskRef.current = await buildMaterialMask(segResult);
+            segR.current = await buildMatMask(sr);
           }
-
           setAiStep("generating");
           await new Promise((r) => requestAnimationFrame(r));
-          if (tid !== token.current) return;
-
-          const res = resRef.current;
-          const isTiled =
+          if (tid !== tok.current) return;
+          const isTile =
             Math.min(
               1,
-              res /
-                Math.max(
-                  imgRef.current.naturalWidth,
-                  imgRef.current.naturalHeight,
-                ),
+              resR.current / Math.max(img.naturalWidth, img.naturalHeight),
             ) *
-              Math.max(
-                imgRef.current.naturalWidth,
-                imgRef.current.naturalHeight,
-              ) >
-            TILE_SIZE;
-          if (isTiled) setAiStep("tiling");
-
+              Math.max(img.naturalWidth, img.naturalHeight) >
+            TILE;
+          if (isTile) setAiStep("tiling");
           const result = await generateMaps(
-            imgRef.current,
-            depthRef.current,
-            segMaskRef.current,
-            settingRef.current,
-            res,
-            (cur, total) => {
-              if (tid === token.current) setTileProgress({ cur, total });
+            imgR.current,
+            depR.current,
+            segR.current,
+            setR.current,
+            resR.current,
+            (c, t) => {
+              if (tid === tok.current) setTileProg({ c, t });
             },
           );
-          if (tid !== token.current) return;
+          if (tid !== tok.current) return;
           setMaps(result);
           setAiStep("ready");
-          setTileProgress(null);
+          setTileProg(null);
         } catch (err) {
-          if (tid !== token.current) return;
-          console.error("[Mapper]", err);
+          if (tid !== tok.current) return;
+          console.error(err);
           setAiStep("error");
         } finally {
-          if (tid === token.current) setProc(false);
+          if (tid === tok.current) setProc(false);
         }
       };
       img.src = url;
     },
-    [qualityMode],
+    [quality],
   );
 
-  /* ── Reprocess on settings/resolution change ───────────── */
+  /* 💡 개선 포인트 1: Quality 토글 즉시 적용 (깊이 AI는 재사용) */
   useEffect(() => {
-    if (!depthRef.current || !imgRef.current) return;
-    const id = setTimeout(async () => {
+    if (!imgR.current || !srcURL || !depR.current) return;
+    const tid = ++tok.current;
+
+    const runQualitySwitch = async () => {
       setProc(true);
-      setTileProgress(null);
-      const res = resolution;
-      const isTiled =
+      setTileProg(null);
+      try {
+        if (quality) {
+          setAiStep("segload");
+          const sg = await getSeg();
+          if (tid !== tok.current) return;
+          setAiStep("seginfer");
+          const sr = await sg(srcURL);
+          if (tid !== tok.current) return;
+          setAiStep("segmask");
+          segR.current = await buildMatMask(sr);
+        } else {
+          segR.current = null; // 마스크 즉시 초기화
+        }
+
+        if (tid !== tok.current) return;
+        const isTile =
+          Math.min(
+            1,
+            res /
+              Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight),
+          ) *
+            Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight) >
+          TILE;
+
+        setAiStep(isTile ? "tiling" : "generating");
+        const r = await generateMaps(
+          imgR.current,
+          depR.current,
+          segR.current,
+          settings,
+          res,
+          (c, t) => {
+            if (tid === tok.current) setTileProg({ c, t });
+          },
+        );
+
+        if (tid !== tok.current) return;
+        setMaps(r);
+        setAiStep("ready");
+      } catch (err) {
+        console.error(err);
+        if (tid === tok.current) setAiStep("error");
+      } finally {
+        if (tid === tok.current) {
+          setTileProg(null);
+          setProc(false);
+        }
+      }
+    };
+    runQualitySwitch();
+  }, [quality]);
+
+  /* 💡 개선 포인트 2, 3: 세팅/해상도 조작 시 레이스 컨디션 및 에러 무한 로딩 방지 */
+  useEffect(() => {
+    if (!depR.current || !imgR.current) return;
+    const tid = ++tok.current; // 조작마다 고유 번호표 발급
+
+    const id = setTimeout(async () => {
+      if (tid !== tok.current) return; // 이전 예약된 명령은 취소
+      setProc(true);
+      setTileProg(null);
+
+      const isTile =
         Math.min(
           1,
-          res /
-            Math.max(imgRef.current.naturalWidth, imgRef.current.naturalHeight),
+          res / Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight),
         ) *
-          Math.max(imgRef.current.naturalWidth, imgRef.current.naturalHeight) >
-        TILE_SIZE;
-      if (isTiled) setAiStep("tiling");
-      else setAiStep("generating");
-      const result = await generateMaps(
-        imgRef.current,
-        depthRef.current,
-        segMaskRef.current,
-        settings,
-        res,
-        (c, t) => setTileProgress({ cur: c, total: t }),
-      );
-      setMaps(result);
-      setAiStep("ready");
-      setTileProgress(null);
-      setProc(false);
+          Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight) >
+        TILE;
+
+      setAiStep(isTile ? "tiling" : "generating");
+
+      try {
+        const r = await generateMaps(
+          imgR.current,
+          depR.current,
+          segR.current,
+          settings,
+          res,
+          (c, t) => {
+            if (tid === tok.current) setTileProg({ c, t });
+          },
+        );
+
+        if (tid !== tok.current) return;
+        setMaps(r);
+        setAiStep("ready");
+      } catch (err) {
+        console.error(err);
+        if (tid === tok.current) setAiStep("error");
+      } finally {
+        if (tid === tok.current) {
+          setTileProg(null);
+          setProc(false);
+        }
+      }
     }, 250);
     return () => clearTimeout(id);
-  }, [settings, resolution]);
+  }, [settings, res]);
 
-  /* ── Three.js init ─────────────────────────────────────── */
+  /* Three.js */
   useEffect(() => {
-    const el = canvasRef.current;
+    const el = cvs.current;
     if (!el) return;
     const renderer = new THREE.WebGLRenderer({ canvas: el, antialias: true });
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
-    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(48, 1, 0.01, 50);
     camera.position.z = 3.2;
-    const env = buildEnvMap(renderer, "studio");
+    const env = buildEnv(renderer, "studio");
     scene.environment = env;
     scene.background = env;
-    const key = new THREE.DirectionalLight(0xfff4d6, 0.6);
-    key.position.set(4, 5, 3);
-    scene.add(key);
-    const geos = {
+
+    const light = new THREE.DirectionalLight(0xfff4d6, 0.6);
+    light.position.set(4, 5, 3);
+    scene.add(light);
+
+    const G = {
       sphere: new THREE.SphereGeometry(1, 128, 64),
       plane: new THREE.PlaneGeometry(2, 2, 64, 64),
       torus: new THREE.TorusGeometry(0.72, 0.34, 64, 128),
     };
-    Object.values(geos).forEach((g) => g.setAttribute("uv2", g.attributes.uv));
+    Object.values(G).forEach((g) => g.setAttribute("uv2", g.attributes.uv));
     const mat = new THREE.MeshStandardMaterial({
       roughness: 0.5,
-      metalness: 0.0,
-      color: 0xcccccc,
+      metalness: 0,
+      color: 0xd0d0d0,
       envMapIntensity: 1,
     });
-    const mesh = new THREE.Mesh(geos.sphere, mat);
+    const mesh = new THREE.Mesh(G.sphere, mat);
     scene.add(mesh);
-    const gMesh = new THREE.Mesh(
+    const gm = new THREE.Mesh(
       new THREE.PlaneGeometry(20, 20),
-      new THREE.MeshStandardMaterial({
-        color: 0x0a0a20,
-        roughness: 1,
-        metalness: 0,
-      }),
+      new THREE.MeshStandardMaterial({ color: 0x0a0a18, roughness: 1 }),
     );
-    gMesh.rotation.x = -Math.PI / 2;
-    gMesh.position.y = -1.4;
-    scene.add(gMesh);
-    three.current = { renderer, scene, camera, mat, mesh, geos };
+    gm.rotation.x = -Math.PI / 2;
+    gm.position.y = -1.4;
+    scene.add(gm);
+    threeR.current = { renderer, scene, camera, mat, mesh, G };
     const resize = () => {
       const w = el.clientWidth,
         h = el.clientHeight || 1;
@@ -1222,21 +1012,20 @@ export default function App() {
       window.removeEventListener("mousemove", om);
     };
   }, []);
-
   useEffect(() => {
-    const { renderer, scene } = three.current;
+    const { renderer, scene } = threeR.current;
     if (!renderer || !scene) return;
-    const e = buildEnvMap(renderer, hdriPreset);
+    const e = buildEnv(renderer, hdri);
     scene.environment = e;
     scene.background = e;
-  }, [hdriPreset]);
+  }, [hdri]);
   useEffect(() => {
-    const { mesh, geos } = three.current;
+    const { mesh, G } = threeR.current;
     if (!mesh) return;
-    mesh.geometry = geos[previewShape] ?? geos.sphere;
-  }, [previewShape]);
+    mesh.geometry = G[shape] ?? G.sphere;
+  }, [shape]);
   useEffect(() => {
-    const { mat } = three.current;
+    const { mat } = threeR.current;
     if (!mat) return;
     [
       mat.map,
@@ -1247,30 +1036,30 @@ export default function App() {
     ].forEach((t) => {
       if (!t) return;
       t.wrapS = t.wrapT = THREE.RepeatWrapping;
-      t.repeat.set(tileCount, tileCount);
+      t.repeat.set(tileRep, tileRep);
       t.needsUpdate = true;
     });
-  }, [tileCount]);
+  }, [tileRep]);
   useEffect(() => {
-    const { mat } = three.current;
+    const { mat } = threeR.current;
     if (!mat || !srcURL) return;
     new THREE.TextureLoader().load(srcURL, (t) => {
       t.colorSpace = THREE.SRGBColorSpace;
       t.wrapS = t.wrapT = THREE.RepeatWrapping;
-      t.repeat.set(tileCount, tileCount);
+      t.repeat.set(tileRep, tileRep);
       mat.map?.dispose();
       mat.map = t;
       mat.needsUpdate = true;
     });
   }, [srcURL]);
   useEffect(() => {
-    const { mat } = three.current;
+    const { mat } = threeR.current;
     if (!mat || !maps) return;
     const L = new THREE.TextureLoader();
     const ld = (u, cb) =>
       L.load(u, (t) => {
         t.wrapS = t.wrapT = THREE.RepeatWrapping;
-        t.repeat.set(tileCount, tileCount);
+        t.repeat.set(tileRep, tileRep);
         cb(t);
       });
     ld(maps.normal, (t) => {
@@ -1299,101 +1088,104 @@ export default function App() {
     });
   }, [maps]);
 
-  /* ── Helpers ────────────────────────────────────────────── */
-  const setS = (k) => (e) =>
+  const ss = (k) => (e) =>
     setSettings((s) => ({ ...s, [k]: parseFloat(e.target.value) }));
-  const togS = (k) => () => setSettings((s) => ({ ...s, [k]: !s[k] }));
-  const dl = (key) => {
-    if (!maps?.[key]) return;
+  const tg = (k) => () => setSettings((s) => ({ ...s, [k]: !s[k] }));
+  const dl = (k) => {
+    if (!maps?.[k]) return;
     const a = document.createElement("a");
-    a.href = maps[key];
-    a.download = `unarrived_${key}.png`;
+    a.href = maps[k];
+    a.download = `unarrived_${k}.png`;
     a.click();
   };
   const dlAll = async () => {
     if (!maps || exporting) return;
     setExporting(true);
     try {
-      await exportZip(maps, resolution);
+      await doZip(maps, res);
     } finally {
       setExporting(false);
     }
   };
-  const runAnalyze = useCallback(() => {
-    if (!imgRef.current || proc) return;
+  const analyze = () => {
+    if (!imgR.current || proc) return;
     setAiStep("analyzing");
     setTimeout(() => {
-      const h = analyzeAlbedo(imgRef.current);
-      setAnalyzeHint(h);
+      const h = analyzeAlbedo(imgR.current);
+      setHint(h);
       setSettings((s) => ({ ...s, ...h }));
       setAiStep("ready");
     }, 80);
-  }, [proc]);
+  };
 
-  const step = AI_STEPS[aiStep];
-  const availRes = ALL_RES.filter((r) => r <= gpuInfo.maxTex);
-  const tileTotal = tileProgress?.total ?? 0;
-  const tileCur = tileProgress?.cur ?? 0;
+  const step = STEPS[aiStep];
+  const availRes = ALL_RES.filter((r) => r <= gpu.maxTex);
 
   return (
     <>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Oxanium:wght@300;400;600;700&family=JetBrains+Mono:wght@300;400&display=swap');
-        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0} body{overflow:hidden}
-        ::-webkit-scrollbar{width:3px} ::-webkit-scrollbar-track{background:#06060f} ::-webkit-scrollbar-thumb{background:#1a1a2e;border-radius:2px}
-        input[type=range]{-webkit-appearance:none;width:100%;height:2px;background:#181828;outline:none;cursor:pointer;border-radius:1px}
-        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:11px;height:11px;border-radius:50%;background:#e8a020;cursor:pointer;box-shadow:0 0 6px #e8a02055}
-        @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-        @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
-        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-      `}</style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+      *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+      html,body{height:100%;overflow:hidden;background:${C.bg}}
+      body{font-family:'Inter',sans-serif;font-size:13px;color:${C.text};-webkit-font-smoothing:antialiased}
+      ::-webkit-scrollbar{width:4px}
+      ::-webkit-scrollbar-track{background:${C.sidebar}}
+      ::-webkit-scrollbar-thumb{background:${C.border};border-radius:4px}
+      ::-webkit-scrollbar-thumb:hover{background:${C.borderHi}}
+      input[type=range]{-webkit-appearance:none;width:100%;height:3px;background:${C.panel};outline:none;cursor:pointer;border-radius:2px}
+      input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:${C.accent};cursor:pointer;border:2px solid ${C.bg};box-shadow:0 0 0 1px ${C.accentDim}}
+      input[type=range]:hover{background:${C.border}}
+      @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+      @keyframes spin{to{transform:rotate(360deg)}}
+      @keyframes fadein{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+      button{font-family:'Inter',sans-serif;transition:all .15s}
+      button:hover:not(:disabled){filter:brightness(1.15)}
+    `}</style>
 
       <div
         style={{
           display: "flex",
           height: "100vh",
-          background: "#060610",
-          color: "#9090b8",
-          fontFamily: "'Oxanium',sans-serif",
+          background: C.bg,
           overflow: "hidden",
-          userSelect: "none",
         }}
       >
         {/* ═══ LEFT SIDEBAR ═══ */}
-        <div
+        <aside
           style={{
-            width: 252,
+            width: 280,
             flexShrink: 0,
-            borderRight: "1px solid #111124",
+            borderRight: `1px solid ${C.border}`,
             display: "flex",
             flexDirection: "column",
+            background: C.sidebar,
             overflowY: "auto",
           }}
         >
-          {/* Logo */}
+          {/* Header */}
           <div
             style={{
-              padding: "13px 18px 9px",
-              borderBottom: "1px solid #111124",
+              padding: "20px 20px 16px",
+              borderBottom: `1px solid ${C.border}`,
             }}
           >
             <div
               style={{
-                fontSize: 6,
-                letterSpacing: 6,
-                color: "#20203a",
-                marginBottom: 3,
+                fontSize: 10,
+                letterSpacing: 4,
+                color: C.textFaint,
+                fontFamily: "'JetBrains Mono',monospace",
+                marginBottom: 4,
               }}
             >
               UNARRIVED
             </div>
             <div
               style={{
-                fontSize: 19,
-                fontWeight: 700,
-                color: "#e8a020",
-                letterSpacing: 2,
+                fontSize: 24,
+                fontWeight: 600,
+                color: C.accent,
+                letterSpacing: 1,
                 lineHeight: 1,
               }}
             >
@@ -1401,19 +1193,18 @@ export default function App() {
             </div>
             <div
               style={{
-                fontSize: 6,
-                color: "#22c55e",
-                letterSpacing: 3,
-                marginTop: 4,
+                fontSize: 11,
+                color: C.textDim,
+                marginTop: 6,
                 fontFamily: "'JetBrains Mono',monospace",
               }}
             >
-              SMART PBR · MATERIAL AI · v6
+              Smart PBR · Material AI · v6
             </div>
           </div>
 
           {/* Drop zone */}
-          <div style={{ padding: "9px 9px 5px" }}>
+          <div style={{ padding: "14px 14px 8px" }}>
             <div
               onDragOver={(e) => {
                 e.preventDefault();
@@ -1433,10 +1224,10 @@ export default function App() {
                 i.click();
               }}
               style={{
-                border: `1px dashed ${dragOver ? "#e8a020" : "#1c1c30"}`,
-                borderRadius: 5,
+                border: `2px dashed ${dragOver ? C.accent : C.border}`,
+                borderRadius: 8,
                 cursor: "pointer",
-                background: dragOver ? "#120e01" : "#09091a",
+                background: dragOver ? "#1c1400" : C.panel,
                 transition: "all .2s",
                 overflow: "hidden",
               }}
@@ -1446,177 +1237,158 @@ export default function App() {
                   src={srcURL}
                   style={{
                     width: "100%",
-                    height: 68,
+                    height: 100,
                     objectFit: "cover",
                     display: "block",
                   }}
                 />
               ) : (
-                <div style={{ padding: "16px 12px", textAlign: "center" }}>
+                <div style={{ padding: "28px 16px", textAlign: "center" }}>
+                  <div style={{ fontSize: 28, marginBottom: 8 }}>⬡</div>
                   <div
-                    style={{ fontSize: 18, color: "#18182e", marginBottom: 4 }}
+                    style={{ fontSize: 13, color: C.textDim, fontWeight: 500 }}
                   >
-                    ⬡
+                    Drop albedo image here
                   </div>
                   <div
-                    style={{ fontSize: 7, letterSpacing: 3, color: "#30304a" }}
+                    style={{ fontSize: 11, color: C.textFaint, marginTop: 4 }}
                   >
-                    DROP IMAGE HERE
+                    or click to browse
                   </div>
                 </div>
               )}
-              <div
-                style={{
-                  padding: "3px 9px",
-                  fontSize: 7,
-                  letterSpacing: 3,
-                  color: srcURL ? "#303050" : "#202035",
-                  background: "#07070f",
-                }}
-              >
-                {srcURL ? "ALBEDO · REPLACE" : "OR BROWSE"}
-              </div>
+              {srcURL && (
+                <div
+                  style={{
+                    padding: "6px 12px",
+                    fontSize: 11,
+                    color: C.textDim,
+                    background: C.sidebar,
+                    borderTop: `1px solid ${C.border}`,
+                  }}
+                >
+                  {imgInfo && `${imgInfo.w} × ${imgInfo.h}px · `}Click to
+                  replace
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Mode + Status */}
+          {/* Mode toggle */}
           <div
             style={{
-              padding: "5px 10px 4px",
-              borderBottom: "1px solid #0d0d1e",
+              padding: "10px 14px 8px",
+              borderBottom: `1px solid ${C.border}`,
             }}
           >
-            {/* Quality mode toggle */}
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
-                marginBottom: 5,
+                padding: "8px 12px",
+                background: C.panel,
+                borderRadius: 6,
+                border: `1px solid ${quality ? C.purple + "66" : C.border}`,
               }}
             >
               <div>
                 <div
                   style={{
-                    fontSize: 6,
-                    letterSpacing: 3,
-                    color: qualityMode ? "#d060c0" : "#282840",
-                    fontFamily: "'JetBrains Mono',monospace",
+                    fontSize: 12,
+                    fontWeight: 600,
+                    color: quality ? C.purple : C.text,
                   }}
                 >
-                  {qualityMode ? "QUALITY MODE" : "FAST MODE"}
+                  {quality ? "Quality Mode" : "Fast Mode"}
                 </div>
-                <div
-                  style={{
-                    fontSize: 5,
-                    letterSpacing: 2,
-                    color: "#141428",
-                    fontFamily: "'JetBrains Mono',monospace",
-                    marginTop: 1,
-                  }}
-                >
-                  {qualityMode
+                <div style={{ fontSize: 11, color: C.textDim, marginTop: 1 }}>
+                  {quality
                     ? "+ Material Segmentation"
                     : "Depth-Anything V2 only"}
                 </div>
               </div>
-              <div
-                onClick={() => setQualityMode((v) => !v)}
-                style={{
-                  width: 30,
-                  height: 14,
-                  borderRadius: 7,
-                  cursor: "pointer",
-                  position: "relative",
-                  background: qualityMode ? "#8020a0" : "#141428",
-                  transition: "background .2s",
-                  border: "1px solid #2a1a3a",
-                  flexShrink: 0,
-                }}
-              >
-                <div
-                  style={{
-                    position: "absolute",
-                    top: 2,
-                    width: 9,
-                    height: 9,
-                    borderRadius: 5,
-                    background: qualityMode ? "#f090ff" : "#383858",
-                    left: qualityMode ? 19 : 2,
-                    transition: "left .2s",
-                  }}
-                />
-              </div>
+              <Toggle
+                value={quality}
+                onChange={() => setQuality((v) => !v)}
+                color={C.purple}
+              />
             </div>
-            {/* Status row */}
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span
+          </div>
+
+          {/* Status bar */}
+          <div
+            style={{
+              padding: "10px 14px",
+              borderBottom: `1px solid ${C.border}`,
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div
                 style={{
-                  fontSize: 8,
-                  color: step.color,
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  background: step.dot,
+                  flexShrink: 0,
                   animation: proc ? "blink 1s infinite" : "none",
                 }}
-              >
-                ◈
-              </span>
-              <span
+              />
+              <div
                 style={{
-                  fontSize: 7,
-                  letterSpacing: 2,
-                  color: step.color,
-                  fontFamily: "'JetBrains Mono',monospace",
+                  fontSize: 12,
+                  color: proc ? step.dot : C.textDim,
                   flex: 1,
-                  animation: proc ? "pulse 1.4s infinite" : "none",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
+                  fontWeight: proc ? 500 : 400,
                 }}
               >
                 {step.label}
-              </span>
+              </div>
               <button
-                onClick={runAnalyze}
-                disabled={!imgRef.current || proc}
+                onClick={analyze}
+                disabled={!imgR.current || proc}
                 style={{
-                  padding: "2px 7px",
-                  borderRadius: 2,
-                  fontSize: 6,
-                  letterSpacing: 1,
-                  cursor: imgRef.current && !proc ? "pointer" : "not-allowed",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  background: imgRef.current && !proc ? "#180a14" : "#08080f",
-                  border: `1px solid ${imgRef.current && !proc ? "#501840" : "#0d0d1e"}`,
-                  color: imgRef.current && !proc ? "#c050a0" : "#1e1e30",
-                  whiteSpace: "nowrap",
-                  flexShrink: 0,
+                  padding: "3px 10px",
+                  borderRadius: 4,
+                  fontSize: 11,
+                  fontWeight: 500,
+                  border: `1px solid ${imgR.current && !proc ? C.pink : C.border}`,
+                  background: "transparent",
+                  color: imgR.current && !proc ? C.pink : C.textFaint,
+                  cursor: imgR.current && !proc ? "pointer" : "not-allowed",
                 }}
               >
-                AI ANA
+                Analyze
               </button>
             </div>
-            {/* Tile progress bar */}
-            {tileProgress && (
-              <div style={{ marginTop: 5 }}>
+            {tileProg && (
+              <div>
                 <div
                   style={{
-                    fontSize: 6,
-                    letterSpacing: 2,
-                    color: "#e8a02066",
-                    fontFamily: "'JetBrains Mono',monospace",
-                    marginBottom: 3,
+                    display: "flex",
+                    justifyContent: "space-between",
+                    fontSize: 11,
+                    color: C.textDim,
+                    marginBottom: 4,
                   }}
                 >
-                  TILE {tileCur}/{tileTotal}
+                  <span>
+                    Processing tile {tileProg.c} of {tileProg.t}
+                  </span>
+                  <span>{Math.round((tileProg.c / tileProg.t) * 100)}%</span>
                 </div>
                 <div
-                  style={{ height: 2, background: "#181828", borderRadius: 1 }}
+                  style={{ height: 3, background: C.panel, borderRadius: 2 }}
                 >
                   <div
                     style={{
                       height: "100%",
-                      background: "#e8a020",
-                      borderRadius: 1,
-                      width: `${((tileCur / tileTotal) * 100).toFixed(0)}%`,
+                      background: C.accent,
+                      borderRadius: 2,
+                      width: `${(tileProg.c / tileProg.t) * 100}%`,
                       transition: "width .2s",
                     }}
                   />
@@ -1625,262 +1397,258 @@ export default function App() {
             )}
           </div>
 
-          {/* Auto-analyze result */}
-          {analyzeHint && (
+          {/* Analyze hint */}
+          {hint && (
             <div
               style={{
-                padding: "5px 11px",
-                background: "#0d0820",
-                borderBottom: "1px solid #1a0830",
+                padding: "10px 14px",
+                background: "#140d1f",
+                borderBottom: `1px solid ${C.purple}33`,
               }}
             >
               <div
                 style={{
-                  fontSize: 6,
-                  letterSpacing: 2,
-                  color: "#a040a0",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  marginBottom: 3,
+                  fontSize: 11,
+                  color: C.purple,
+                  fontWeight: 600,
+                  marginBottom: 6,
                 }}
               >
-                ◈ ANALYZED
+                ✦ AI Analysis Applied
               </div>
               <div
                 style={{
-                  fontSize: 5,
-                  color: "#5a1a5a",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  lineHeight: 1.6,
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: "3px 12px",
                 }}
               >
-                {Object.entries(analyzeHint).map(([k, v]) => (
-                  <span key={k} style={{ marginRight: 8 }}>
-                    {k}={typeof v === "number" ? v.toFixed(2) : String(v)}
-                  </span>
+                {Object.entries(hint).map(([k, v]) => (
+                  <div
+                    key={k}
+                    style={{
+                      fontSize: 10,
+                      color: C.textDim,
+                      fontFamily: "'JetBrains Mono',monospace",
+                    }}
+                  >
+                    <span style={{ color: C.textFaint }}>
+                      {k.replace(/([A-Z])/g, " $1").toLowerCase()}
+                    </span>
+                    <span style={{ color: C.purple, marginLeft: 4 }}>
+                      {typeof v === "number" ? v.toFixed(2) : String(v)}
+                    </span>
+                  </div>
                 ))}
               </div>
             </div>
           )}
 
           {/* Controls */}
-          <div style={{ padding: "0 12px 10px", flex: 1 }}>
-            <Sec label="NORMAL MAP">
-              <Sld
-                label="DEPTH STR"
+          <div style={{ padding: "8px 14px 14px", flex: 1 }}>
+            <Section label="Normal Map">
+              <Slider
+                label="Depth Strength"
                 v={settings.normalStr}
                 min={0.5}
                 max={14}
                 step={0.1}
-                onChange={setS("normalStr")}
+                onChange={ss("normalStr")}
               />
-              <Sld
-                label="DETAIL MIX"
+              <Slider
+                label="Detail Mix"
                 v={settings.detailMix}
                 min={0}
                 max={1}
                 step={0.01}
-                onChange={setS("detailMix")}
-                hint="Highpass → normal blend"
+                onChange={ss("detailMix")}
+                hint="Highpass albedo → normal contribution"
               />
-              <Sld
-                label="BILATERAL σ"
+              <Slider
+                label="Bilateral σ"
                 v={settings.normalSigma}
                 min={0.01}
                 max={0.3}
                 step={0.01}
-                onChange={setS("normalSigma")}
+                onChange={ss("normalSigma")}
                 hint="Depth edge preservation"
               />
-            </Sec>
+            </Section>
 
-            <Sec label="DISPLACEMENT">
-              <Sld
-                label="MIDPOINT"
+            <Section label="Displacement">
+              <Slider
+                label="Midpoint"
                 v={settings.dispMid}
                 min={0}
                 max={1}
                 step={0.01}
-                onChange={setS("dispMid")}
+                onChange={ss("dispMid")}
                 hint="Neutral depth level"
               />
-              <Sld
-                label="CONTRAST"
+              <Slider
+                label="Contrast"
                 v={settings.dispCon}
                 min={0.5}
                 max={6}
                 step={0.1}
-                onChange={setS("dispCon")}
+                onChange={ss("dispCon")}
               />
-              <Tog
-                label="INVERT"
-                v={settings.dispInv}
-                onChange={togS("dispInv")}
+              <Toggle
+                label="Invert"
+                value={settings.dispInv}
+                onChange={tg("dispInv")}
               />
-            </Sec>
+            </Section>
 
-            <Sec label="ROUGHNESS">
-              <Sld
-                label="CONTRAST"
+            <Section label="Roughness">
+              <Slider
+                label="Contrast"
                 v={settings.roughCon}
                 min={0.5}
                 max={6}
                 step={0.1}
-                onChange={setS("roughCon")}
+                onChange={ss("roughCon")}
               />
-              <Sld
-                label="BIAS"
+              <Slider
+                label="Bias"
                 v={settings.roughBias}
                 min={-0.5}
                 max={0.5}
                 step={0.01}
-                onChange={setS("roughBias")}
+                onChange={ss("roughBias")}
               />
-              <Sld
-                label="FREQ MIX"
+              <Slider
+                label="Freq Mix"
                 v={settings.roughDetailMix}
                 min={0}
                 max={1}
                 step={0.01}
-                onChange={setS("roughDetailMix")}
-                hint="0=depth · 1=freq-energy"
+                onChange={ss("roughDetailMix")}
+                hint="0 = depth lum · 1 = surface complexity"
               />
-              <Sld
-                label="MAT BLEND"
+              <Slider
+                label="Material Blend"
                 v={settings.matBlend}
                 min={0}
                 max={1}
                 step={0.01}
-                onChange={setS("matBlend")}
-                hint="0=heuristic · 1=class preset"
+                onChange={ss("matBlend")}
+                hint="0 = heuristic · 1 = class preset"
               />
-              <Tog
-                label="INVERT"
-                v={settings.roughInv}
-                onChange={togS("roughInv")}
+              <Toggle
+                label="Invert"
+                value={settings.roughInv}
+                onChange={tg("roughInv")}
               />
-            </Sec>
+            </Section>
 
-            <Sec label="METALLIC">
-              <Sld
-                label="THRESHOLD"
+            <Section label="Metallic">
+              <Slider
+                label="Threshold"
                 v={settings.metalThr}
                 min={0}
                 max={1}
                 step={0.01}
-                onChange={setS("metalThr")}
+                onChange={ss("metalThr")}
               />
-              <Sld
-                label="SOFTNESS"
+              <Slider
+                label="Softness"
                 v={settings.metalSoft}
                 min={0.01}
                 max={0.3}
                 step={0.01}
-                onChange={setS("metalSoft")}
+                onChange={ss("metalSoft")}
               />
-            </Sec>
+            </Section>
 
-            <Sec label="HBAO">
-              <Sld
-                label="RADIUS"
+            <Section label="Ambient Occlusion (HBAO)">
+              <Slider
+                label="Radius"
                 v={settings.aoRadius}
                 min={0.1}
                 max={3}
                 step={0.05}
-                onChange={setS("aoRadius")}
+                onChange={ss("aoRadius")}
               />
-              <Sld
-                label="STRENGTH"
+              <Slider
+                label="Strength"
                 v={settings.aoStr}
                 min={0}
                 max={3}
                 step={0.05}
-                onChange={setS("aoStr")}
+                onChange={ss("aoStr")}
               />
-            </Sec>
+            </Section>
 
-            <Sec label="CURVATURE">
-              <Sld
-                label="SCALE"
+            <Section label="Curvature">
+              <Slider
+                label="Scale"
                 v={settings.curvScale}
                 min={0.1}
                 max={4}
                 step={0.05}
-                onChange={setS("curvScale")}
-                hint="Multi-scale blend: 1px / 4px / 12px"
+                onChange={ss("curvScale")}
+                hint="Multi-scale: 1px / 4px / 12px blend"
               />
-            </Sec>
+            </Section>
 
-            <Sec label="FREQ SEPARATION">
-              <Sld
-                label="BLUR RADIUS"
+            <Section label="Frequency Separation">
+              <Slider
+                label="Blur Radius"
                 v={settings.blurRadius}
                 min={1}
                 max={24}
                 step={0.5}
-                onChange={setS("blurRadius")}
+                onChange={ss("blurRadius")}
+                hint="Larger = wider detail extraction"
               />
-            </Sec>
+            </Section>
           </div>
 
           {/* GPU + Resolution */}
-          <div style={{ padding: "6px 10px", borderTop: "1px solid #111124" }}>
+          <div
+            style={{ padding: "12px 14px", borderTop: `1px solid ${C.border}` }}
+          >
             <div
               style={{
-                fontSize: 5,
-                letterSpacing: 2,
-                color: "#0c0c1c",
+                fontSize: 11,
+                color: C.textFaint,
                 fontFamily: "'JetBrains Mono',monospace",
-                marginBottom: 4,
-                lineHeight: 1.7,
+                marginBottom: 10,
                 overflow: "hidden",
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
               }}
             >
-              {gpuInfo.renderer} · MAX {gpuInfo.maxTex}px
+              {gpu.renderer} · max {gpu.maxTex}px
             </div>
-            <div
-              style={{
-                fontSize: 6,
-                letterSpacing: 4,
-                color: "#1a1a30",
-                marginBottom: 5,
-              }}
-            >
-              OUTPUT RES
-            </div>
-            <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+            <Label>Output Resolution</Label>
+            <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
               {ALL_RES.map((r) => {
-                const avail = r <= gpuInfo.maxTex;
-                const active = resolution === r;
-                const warn = r >= 4096 && avail;
+                const avail = r <= gpu.maxTex,
+                  active = r === res,
+                  warn = r >= 4096;
                 return (
                   <button
                     key={r}
-                    onClick={() => avail && setResolution(r)}
+                    onClick={() => avail && setRes(r)}
                     disabled={!avail}
                     style={{
-                      flex: "1 0 38px",
-                      padding: "4px 2px",
-                      borderRadius: 2,
-                      fontSize: 7,
+                      flex: 1,
+                      padding: "6px 4px",
+                      borderRadius: 4,
+                      fontSize: 11,
+                      fontWeight: active ? 600 : 400,
                       cursor: avail ? "pointer" : "not-allowed",
-                      fontFamily: "'JetBrains Mono',monospace",
-                      transition: "all .15s",
-                      background: active
-                        ? "#1a1a2e"
-                        : avail
-                          ? "#08081a"
-                          : "#050508",
-                      border: `1px solid ${active ? "#4a4a70" : warn ? "#403010" : avail ? "#111128" : "#090912"}`,
+                      background: active ? C.accent + 22 : "transparent",
+                      border: `1px solid ${active ? C.accent : avail ? C.border : C.border + "44"}`,
                       color: active
-                        ? "#c8c8e8"
-                        : warn
-                          ? "#806020"
-                          : avail
-                            ? "#282840"
-                            : "#141418",
-                      opacity: avail ? 1 : 0.4,
+                        ? C.accent
+                        : avail
+                          ? warn
+                            ? C.yellow
+                            : C.text
+                          : C.textFaint,
                     }}
                   >
                     {r >= 1000 ? `${r / 1000}K` : r}
@@ -1888,52 +1656,55 @@ export default function App() {
                 );
               })}
             </div>
-            {resolution >= 4096 && (
+            {res >= 4096 && (
               <div
                 style={{
-                  marginTop: 4,
-                  fontSize: 5,
-                  color: "#504010",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  lineHeight: 1.6,
+                  marginTop: 8,
+                  padding: "6px 10px",
+                  background: "#1c1400",
+                  border: `1px solid ${C.accent}33`,
+                  borderRadius: 4,
+                  fontSize: 11,
+                  color: C.accentDim,
                 }}
               >
-                ⚠ Tiled · ~{vramMB(TILE_SIZE)}MB VRAM/tile
+                ⚠ Tiled rendering · ~{vramMB(TILE)}MB VRAM/tile
               </div>
             )}
           </div>
 
           {/* Export */}
           <div
-            style={{ padding: "7px 9px 11px", borderTop: "1px solid #111124" }}
+            style={{
+              padding: "12px 14px 16px",
+              borderTop: `1px solid ${C.border}`,
+            }}
           >
             <div
               style={{
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "center",
-                marginBottom: 5,
+                marginBottom: 10,
               }}
             >
-              <div style={{ fontSize: 6, letterSpacing: 4, color: "#1e1e35" }}>
-                EXPORT
-              </div>
+              <Label>Export</Label>
               <button
                 onClick={dlAll}
                 disabled={!maps || exporting}
                 style={{
-                  padding: "2px 8px",
-                  borderRadius: 2,
-                  fontSize: 7,
-                  letterSpacing: 2,
-                  cursor: maps && !exporting ? "pointer" : "not-allowed",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  background: maps && !exporting ? "#1a2030" : "#080810",
-                  border: `1px solid ${maps && !exporting ? "#2a4060" : "#0d0d1e"}`,
-                  color: maps && !exporting ? "#60a0e0" : "#1e1e30",
                   display: "flex",
                   alignItems: "center",
-                  gap: 4,
+                  gap: 6,
+                  padding: "6px 12px",
+                  borderRadius: 4,
+                  fontSize: 12,
+                  fontWeight: 500,
+                  background:
+                    maps && !exporting ? C.blue + "22" : "transparent",
+                  border: `1px solid ${maps && !exporting ? C.blue : C.border}`,
+                  color: maps && !exporting ? C.blue : C.textFaint,
+                  cursor: maps && !exporting ? "pointer" : "not-allowed",
                 }}
               >
                 {exporting ? (
@@ -1941,6 +1712,7 @@ export default function App() {
                     style={{
                       animation: "spin 1s linear infinite",
                       display: "inline-block",
+                      fontSize: 14,
                     }}
                   >
                     ⟳
@@ -1948,103 +1720,129 @@ export default function App() {
                 ) : (
                   <span>⬡</span>
                 )}
-                <span>{exporting ? "…" : "ZIP ALL"}</span>
+                {exporting ? "Packing…" : "Export All ZIP"}
               </button>
             </div>
-            {ALL_MAPS.map((m) => (
-              <button
-                key={m.key}
-                onClick={() => dl(m.key)}
-                disabled={!maps?.[m.key]}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 5,
-                  width: "100%",
-                  padding: "4px 7px",
-                  marginBottom: 2,
-                  borderRadius: 3,
-                  background: "#0a0a1a",
-                  border: `1px solid ${maps?.[m.key] ? "#1c1c32" : "#0d0d1e"}`,
-                  color: maps?.[m.key] ? m.color : "#1e1e30",
-                  cursor: maps?.[m.key] ? "pointer" : "not-allowed",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  fontSize: 7,
-                  letterSpacing: 2,
-                  textAlign: "left",
-                  transition: "all .15s",
-                }}
-              >
-                <span
-                  style={{ opacity: maps?.[m.key] ? 0.7 : 0.3, fontSize: 8 }}
+            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              {ALL_MAPS.map((m) => (
+                <button
+                  key={m.key}
+                  onClick={() => dl(m.key)}
+                  disabled={!maps?.[m.key]}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "7px 10px",
+                    borderRadius: 4,
+                    background: maps?.[m.key] ? "transparent" : C.panel + "88",
+                    border: `1px solid ${maps?.[m.key] ? C.border : C.border + "66"}`,
+                    color: maps?.[m.key] ? C.text : C.textFaint,
+                    cursor: maps?.[m.key] ? "pointer" : "not-allowed",
+                    textAlign: "left",
+                  }}
                 >
-                  ↓
-                </span>
-                <span>{m.label}</span>
-                {m.key === "orm" && (
-                  <span
+                  <div
                     style={{
-                      fontSize: 5,
-                      color: maps?.[m.key] ? "#304050" : "#141420",
-                      marginLeft: "auto",
+                      width: 8,
+                      height: 8,
+                      borderRadius: 2,
+                      background: maps?.[m.key] ? m.color : C.textFaint,
+                      flexShrink: 0,
                     }}
-                  >
-                    UE/UNITY
-                  </span>
-                )}
-              </button>
-            ))}
+                  />
+                  <span style={{ fontSize: 12, flex: 1 }}>{m.label}</span>
+                  {m.key === "orm" && (
+                    <span
+                      style={{
+                        fontSize: 10,
+                        color: C.textDim,
+                        fontFamily: "'JetBrains Mono',monospace",
+                      }}
+                    >
+                      UE/Unity
+                    </span>
+                  )}
+                  {maps?.[m.key] && (
+                    <span style={{ fontSize: 12, color: C.textDim }}>↓</span>
+                  )}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        </aside>
 
-        {/* ═══ CENTER: 3×2 MAP GRID ═══ */}
-        <div
+        {/* ═══ CENTER: MAP GRID ═══ */}
+        <main
           style={{
             flex: 1,
             display: "flex",
             flexDirection: "column",
             minWidth: 0,
+            background: C.bg,
           }}
         >
+          {/* Top bar */}
           <div
             style={{
-              padding: "5px 13px",
-              borderBottom: "1px solid #111124",
+              height: 44,
+              borderBottom: `1px solid ${C.border}`,
               display: "flex",
-              gap: 12,
               alignItems: "center",
-              fontFamily: "'JetBrains Mono',monospace",
-              fontSize: 7,
-              letterSpacing: 2,
-              color: "#1e1e35",
+              padding: "0 20px",
+              gap: 20,
               flexShrink: 0,
             }}
           >
-            <span style={{ color: proc ? step.color + "88" : "#1e1e35" }}>
-              {tileProgress ? `TILE ${tileCur}/${tileTotal}` : step.label}
-            </span>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: "50%",
+                  background: proc ? step.dot : maps ? C.green : C.textFaint,
+                  animation: proc ? "blink 1s infinite" : "none",
+                }}
+              />
+              <span style={{ fontSize: 12, color: C.textDim }}>
+                {tileProg ? `Tile ${tileProg.c}/${tileProg.t}` : step.label}
+              </span>
+            </div>
             {imgInfo && (
-              <span>
-                SRC {imgInfo.w}×{imgInfo.h}
+              <span style={{ fontSize: 12, color: C.textFaint }}>
+                Source: {imgInfo.w}×{imgInfo.h}px
               </span>
             )}
-            <span>OUT {resolution}px</span>
-            <span style={{ marginLeft: "auto", color: "#0e0e1e" }}>
-              {qualityMode ? "MAT-SEG" : "DEPTH-V2"} · BILATERAL · HBAO · ORM
+            <span style={{ fontSize: 12, color: C.textFaint }}>
+              Output: {res}px
             </span>
+            <div
+              style={{
+                marginLeft: "auto",
+                fontSize: 11,
+                color: C.textFaint,
+                fontFamily: "'JetBrains Mono',monospace",
+              }}
+            >
+              {quality ? "depth-anything-v2 + segformer" : "depth-anything-v2"}{" "}
+              · Bilateral · HBAO · ORM
+            </div>
           </div>
+
+          {/* 3×2 grid */}
           <div
             style={{
               flex: 1,
               display: "grid",
               gridTemplateColumns: "1fr 1fr 1fr",
               gridTemplateRows: "1fr 1fr",
-              gap: 1,
-              background: "#020208",
+              gap: 2,
+              padding: 2,
+              background: C.bg,
               overflow: "hidden",
             }}
           >
-            {MAPS_GRID.map((m) => (
+            {MAPS_DEF.map((m) => (
               <MapTile
                 key={m.key}
                 meta={m}
@@ -2056,35 +1854,41 @@ export default function App() {
               />
             ))}
           </div>
-        </div>
+        </main>
 
         {/* ═══ RIGHT: 3D PREVIEW ═══ */}
-        <div
+        <aside
           style={{
-            width: 258,
+            width: 280,
             flexShrink: 0,
-            borderLeft: "1px solid #111124",
+            borderLeft: `1px solid ${C.border}`,
             display: "flex",
             flexDirection: "column",
+            background: C.sidebar,
           }}
         >
           <div
             style={{
-              padding: "5px 12px",
-              borderBottom: "1px solid #111124",
-              fontSize: 6,
-              letterSpacing: 5,
-              color: "#1a1a30",
-              fontFamily: "'JetBrains Mono',monospace",
-              flexShrink: 0,
+              height: 44,
+              borderBottom: `1px solid ${C.border}`,
+              display: "flex",
+              alignItems: "center",
+              padding: "0 16px",
             }}
           >
-            PBR PREVIEW
+            <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>
+              PBR Preview
+            </span>
+            <span
+              style={{ marginLeft: "auto", fontSize: 11, color: C.textFaint }}
+            >
+              Three.js r128
+            </span>
           </div>
 
           <div style={{ flex: 1, position: "relative" }}>
             <canvas
-              ref={canvasRef}
+              ref={cvs}
               style={{
                 width: "100%",
                 height: "100%",
@@ -2103,19 +1907,9 @@ export default function App() {
                   pointerEvents: "none",
                 }}
               >
-                <div
-                  style={{
-                    textAlign: "center",
-                    fontSize: 7,
-                    letterSpacing: 4,
-                    color: "#141428",
-                    fontFamily: "'JetBrains Mono',monospace",
-                    lineHeight: 2,
-                  }}
-                >
-                  LOAD IMAGE
-                  <br />
-                  TO PREVIEW
+                <div style={{ textAlign: "center", color: C.textFaint }}>
+                  <div style={{ fontSize: 28, marginBottom: 8 }}>⬡</div>
+                  <div style={{ fontSize: 13 }}>Load image to preview</div>
                 </div>
               </div>
             )}
@@ -2123,118 +1917,83 @@ export default function App() {
 
           {/* Shape */}
           <div
-            style={{
-              padding: "5px 9px",
-              borderTop: "1px solid #111124",
-              display: "flex",
-              gap: 3,
-              flexShrink: 0,
-            }}
+            style={{ padding: "10px 12px", borderTop: `1px solid ${C.border}` }}
           >
-            {SHAPES.map((sh) => (
-              <button
-                key={sh.key}
-                onClick={() => setPreviewShape(sh.key)}
-                style={{
-                  flex: 1,
-                  padding: "3px 0",
-                  borderRadius: 2,
-                  fontSize: 7,
-                  letterSpacing: 2,
-                  cursor: "pointer",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  transition: "all .15s",
-                  background: previewShape === sh.key ? "#1a1a2e" : "#08081a",
-                  border: `1px solid ${previewShape === sh.key ? "#3a3a60" : "#111128"}`,
-                  color: previewShape === sh.key ? "#9090c8" : "#282840",
-                }}
-              >
-                {sh.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Tile */}
-          <div
-            style={{
-              padding: "4px 9px",
-              borderTop: "1px solid #111124",
-              display: "flex",
-              gap: 3,
-              alignItems: "center",
-              flexShrink: 0,
-            }}
-          >
-            <span
-              style={{
-                fontSize: 6,
-                letterSpacing: 3,
-                color: "#1a1a30",
-                fontFamily: "'JetBrains Mono',monospace",
-                flexShrink: 0,
-              }}
-            >
-              TILE
-            </span>
-            {[1, 2, 4].map((n) => (
-              <button
-                key={n}
-                onClick={() => setTileCount(n)}
-                style={{
-                  flex: 1,
-                  padding: "2px 0",
-                  borderRadius: 2,
-                  fontSize: 8,
-                  cursor: "pointer",
-                  fontFamily: "'JetBrains Mono',monospace",
-                  background: tileCount === n ? "#1a1a2e" : "#08081a",
-                  border: `1px solid ${tileCount === n ? "#3a3a60" : "#111128"}`,
-                  color: tileCount === n ? "#9090c8" : "#282840",
-                }}
-              >
-                {n}×
-              </button>
-            ))}
-          </div>
-
-          {/* HDRI */}
-          <div
-            style={{
-              padding: "5px 9px",
-              borderTop: "1px solid #111124",
-              flexShrink: 0,
-            }}
-          >
-            <div
-              style={{
-                fontSize: 6,
-                letterSpacing: 4,
-                color: "#141428",
-                fontFamily: "'JetBrains Mono',monospace",
-                marginBottom: 4,
-              }}
-            >
-              ENV
-            </div>
-            <div style={{ display: "flex", gap: 3 }}>
-              {HDRI_KEYS.map((k) => (
+            <Label>Preview Shape</Label>
+            <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+              {SHAPES.map((s) => (
                 <button
-                  key={k}
-                  onClick={() => setHdriPreset(k)}
+                  key={s.k}
+                  onClick={() => setShape(s.k)}
                   style={{
                     flex: 1,
-                    padding: "3px 0",
-                    borderRadius: 2,
-                    fontSize: 6,
-                    letterSpacing: 1,
+                    padding: "7px 0",
+                    borderRadius: 4,
+                    fontSize: 12,
+                    fontWeight: shape === s.k ? 600 : 400,
                     cursor: "pointer",
-                    fontFamily: "'JetBrains Mono',monospace",
-                    background: hdriPreset === k ? "#1a1a2e" : "#08081a",
-                    border: `1px solid ${hdriPreset === k ? "#3a3a60" : "#111128"}`,
-                    color: hdriPreset === k ? "#9090c8" : "#202038",
+                    background: shape === s.k ? C.accent + "22" : "transparent",
+                    border: `1px solid ${shape === s.k ? C.accent : C.border}`,
+                    color: shape === s.k ? C.accent : C.textDim,
                   }}
                 >
-                  {HDRI_PRESETS[k].label}
+                  {s.l}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Tile repeat */}
+          <div
+            style={{ padding: "10px 12px", borderTop: `1px solid ${C.border}` }}
+          >
+            <Label>Tile Repeat</Label>
+            <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+              {[1, 2, 4].map((n) => (
+                <button
+                  key={n}
+                  onClick={() => setTileRep(n)}
+                  style={{
+                    flex: 1,
+                    padding: "7px 0",
+                    borderRadius: 4,
+                    fontSize: 12,
+                    fontWeight: tileRep === n ? 600 : 400,
+                    cursor: "pointer",
+                    background: tileRep === n ? C.blue + "22" : "transparent",
+                    border: `1px solid ${tileRep === n ? C.blue : C.border}`,
+                    color: tileRep === n ? C.blue : C.textDim,
+                  }}
+                >
+                  {n}×
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Environment */}
+          <div
+            style={{ padding: "10px 12px", borderTop: `1px solid ${C.border}` }}
+          >
+            <Label>Environment (HDRI)</Label>
+            <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+              {Object.keys(HDRI).map((k) => (
+                <button
+                  key={k}
+                  onClick={() => setHdri(k)}
+                  style={{
+                    flex: 1,
+                    padding: "7px 0",
+                    borderRadius: 4,
+                    fontSize: 11,
+                    fontWeight: hdri === k ? 600 : 400,
+                    cursor: "pointer",
+                    background: hdri === k ? C.teal + "22" : "transparent",
+                    border: `1px solid ${hdri === k ? C.teal : C.border}`,
+                    color: hdri === k ? C.teal : C.textDim,
+                  }}
+                >
+                  {k.charAt(0).toUpperCase() + k.slice(1)}
                 </button>
               ))}
             </div>
@@ -2242,57 +2001,56 @@ export default function App() {
 
           <div
             style={{
-              padding: "4px 9px",
-              borderTop: "1px solid #111124",
-              fontSize: 5,
-              color: "#0e0e1e",
-              letterSpacing: 3,
-              fontFamily: "'JetBrains Mono',monospace",
-              flexShrink: 0,
+              padding: "10px 12px",
+              borderTop: `1px solid ${C.border}`,
+              fontSize: 11,
+              color: C.textFaint,
             }}
           >
-            DRAG ORBIT · AUTO-ROTATE
+            Drag to orbit · Auto-rotates when idle
           </div>
 
           {/* Map legend */}
           <div
             style={{
-              padding: "5px 9px 7px",
-              borderTop: "1px solid #111124",
-              flexShrink: 0,
+              padding: "10px 12px 14px",
+              borderTop: `1px solid ${C.border}`,
             }}
           >
+            <Label>Channels</Label>
             <div
               style={{
-                display: "grid",
-                gridTemplateColumns: "1fr 1fr",
-                gap: "2px 6px",
+                marginTop: 8,
+                display: "flex",
+                flexDirection: "column",
+                gap: 5,
               }}
             >
               {ALL_MAPS.map((m) => (
                 <div
                   key={m.key}
-                  style={{ display: "flex", alignItems: "center", gap: 4 }}
+                  style={{ display: "flex", alignItems: "center", gap: 8 }}
                 >
                   <div
                     style={{
-                      width: 4,
-                      height: 4,
-                      borderRadius: 1,
+                      width: 10,
+                      height: 10,
+                      borderRadius: 2,
                       background: m.color,
-                      opacity: 0.7,
                       flexShrink: 0,
                     }}
                   />
+                  <span style={{ fontSize: 11, color: C.textDim, flex: 1 }}>
+                    {m.label}
+                  </span>
                   <span
                     style={{
-                      fontSize: 5,
-                      letterSpacing: 2,
-                      color: "#141428",
+                      fontSize: 10,
+                      color: C.textFaint,
                       fontFamily: "'JetBrains Mono',monospace",
                     }}
                   >
-                    {m.label}
+                    {m.hint.split("·")[0].trim()}
                   </span>
                 </div>
               ))}
@@ -2302,34 +2060,43 @@ export default function App() {
           {/* Pipeline info */}
           <div
             style={{
-              padding: "5px 9px 8px",
-              borderTop: "1px solid #111124",
-              flexShrink: 0,
+              padding: "10px 12px 14px",
+              borderTop: `1px solid ${C.border}`,
             }}
           >
+            <Label>Pipeline</Label>
             <div
               style={{
-                fontSize: 5,
-                letterSpacing: 2,
-                color: "#0c0c1c",
-                fontFamily: "'JetBrains Mono',monospace",
-                lineHeight: 1.8,
+                marginTop: 8,
+                display: "flex",
+                flexDirection: "column",
+                gap: 3,
               }}
             >
-              DEPTH · depth-anything-v2
-              <br />
-              SEG · segformer-b0-ade (quality)
-              <br />
-              NORM · bilateral sobel
-              <br />
-              AO · HBAO 32-sample spiral
-              <br />
-              CURV · multi-scale 1/4/12px
-              <br />
-              8K · tiled 2048×N + PAD 32
+              {[
+                ["Depth", "depth-anything-v2 (base)"],
+                ["Seg", "segformer-b0-ade (quality)"],
+                ["Normal", "Bilateral Sobel GLSL3"],
+                ["AO", "HBAO 32-sample spiral"],
+                ["Curv", "Multi-scale 1/4/12px"],
+                ["8K", "Tiled 2048×N + 32px pad"],
+              ].map(([k, v]) => (
+                <div
+                  key={k}
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    fontSize: 10,
+                    fontFamily: "'JetBrains Mono',monospace",
+                  }}
+                >
+                  <span style={{ color: C.textFaint, minWidth: 40 }}>{k}</span>
+                  <span style={{ color: C.textDim }}>{v}</span>
+                </div>
+              ))}
             </div>
           </div>
-        </div>
+        </aside>
       </div>
     </>
   );
@@ -2338,32 +2105,45 @@ export default function App() {
 /* ═══════════════════════════════════════════════════════════════
    SUB-COMPONENTS
 ═══════════════════════════════════════════════════════════════ */
-function Sec({ label, children }) {
+function Label({ children }) {
   return (
     <div
       style={{
-        marginBottom: 11,
-        paddingTop: 10,
-        borderTop: "1px solid #0e0e1e",
+        fontSize: 11,
+        fontWeight: 600,
+        color: C.textDim,
+        letterSpacing: 0.5,
+        textTransform: "uppercase",
       }}
     >
+      {children}
+    </div>
+  );
+}
+function Section({ label, children }) {
+  return (
+    <div
+      style={{
+        paddingTop: 16,
+        marginTop: 4,
+        borderTop: `1px solid ${C.border}`,
+      }}
+    >
+      <Label>{label}</Label>
       <div
         style={{
-          fontSize: 6,
-          letterSpacing: 4,
-          color: "#242440",
-          marginBottom: 8,
+          display: "flex",
+          flexDirection: "column",
+          gap: 12,
+          marginTop: 10,
         }}
       >
-        {label}
-      </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
         {children}
       </div>
     </div>
   );
 }
-function Sld({ label, v, min, max, step, onChange, hint }) {
+function Slider({ label, v, min, max, step, onChange, hint }) {
   return (
     <div>
       <div
@@ -2371,17 +2151,16 @@ function Sld({ label, v, min, max, step, onChange, hint }) {
           display: "flex",
           justifyContent: "space-between",
           alignItems: "baseline",
-          marginBottom: 4,
+          marginBottom: 6,
         }}
       >
-        <span style={{ fontSize: 7, letterSpacing: 3, color: "#383858" }}>
-          {label}
-        </span>
+        <span style={{ fontSize: 12, color: C.text }}>{label}</span>
         <span
           style={{
-            fontSize: 9,
+            fontSize: 12,
             fontFamily: "'JetBrains Mono',monospace",
-            color: "#e8a020",
+            fontWeight: 500,
+            color: C.accent,
           }}
         >
           {v.toFixed(2)}
@@ -2396,55 +2175,47 @@ function Sld({ label, v, min, max, step, onChange, hint }) {
         onChange={onChange}
       />
       {hint && (
-        <div
-          style={{
-            fontSize: 5,
-            letterSpacing: 1,
-            color: "#141428",
-            fontFamily: "'JetBrains Mono',monospace",
-            marginTop: 2,
-          }}
-        >
+        <div style={{ fontSize: 10, color: C.textFaint, marginTop: 4 }}>
           {hint}
         </div>
       )}
     </div>
   );
 }
-function Tog({ label, v, onChange }) {
+function Toggle({ label, value, onChange, color = C.accent }) {
   return (
     <div
       style={{
         display: "flex",
         justifyContent: "space-between",
         alignItems: "center",
+        padding: "2px 0",
       }}
     >
-      <span style={{ fontSize: 7, letterSpacing: 3, color: "#383858" }}>
-        {label}
-      </span>
+      {label && <span style={{ fontSize: 12, color: C.text }}>{label}</span>}
       <div
         onClick={onChange}
         style={{
-          width: 28,
-          height: 13,
-          borderRadius: 7,
+          width: 34,
+          height: 18,
+          borderRadius: 9,
           cursor: "pointer",
           position: "relative",
-          background: v ? "#e8a020" : "#141428",
+          background: value ? color : C.panel,
           transition: "background .2s",
-          border: "1px solid #1e1e38",
+          border: `1px solid ${value ? color : C.border}`,
+          flexShrink: 0,
         }}
       >
         <div
           style={{
             position: "absolute",
-            top: 1.5,
-            width: 9,
-            height: 9,
-            borderRadius: 5,
-            background: v ? "#070710" : "#383858",
-            left: v ? 16 : 2,
+            top: 2,
+            width: 12,
+            height: 12,
+            borderRadius: 6,
+            background: value ? "#fff" : C.textDim,
+            left: value ? 18 : 2,
             transition: "left .2s",
           }}
         />
@@ -2458,12 +2229,13 @@ function MapTile({ meta, url, hovered, onEnter, onLeave, onDl }) {
       onMouseEnter={onEnter}
       onMouseLeave={onLeave}
       style={{
-        background: "#07070f",
+        background: "#09090f",
         position: "relative",
         overflow: "hidden",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
+        borderRadius: 4,
       }}
     >
       {url ? (
@@ -2475,46 +2247,50 @@ function MapTile({ meta, url, hovered, onEnter, onLeave, onDl }) {
             height: "100%",
             objectFit: "contain",
             display: "block",
-            animation: "fadeIn .3s ease",
+            animation: "fadein .3s ease",
           }}
         />
       ) : (
-        <div style={{ textAlign: "center", pointerEvents: "none" }}>
+        <div style={{ textAlign: "center", padding: 20 }}>
+          <div style={{ fontSize: 24, marginBottom: 8, opacity: 0.2 }}>◫</div>
+          <div style={{ fontSize: 12, color: C.textFaint }}>{meta.label}</div>
           <div
-            style={{
-              fontSize: 7,
-              letterSpacing: 4,
-              color: "#111125",
-              fontFamily: "'JetBrains Mono',monospace",
-              lineHeight: 2,
-            }}
+            style={{ fontSize: 10, color: C.textFaint + "88", marginTop: 4 }}
           >
-            {meta.label}
-            <br />
-            <span style={{ color: "#0c0c1e" }}>AWAITING AI</span>
+            Awaiting AI depth
           </div>
         </div>
       )}
+
+      {/* Top label */}
       <div
         style={{
           position: "absolute",
           top: 0,
           left: 0,
           right: 0,
-          padding: "4px 7px",
-          background: "linear-gradient(to bottom,rgba(6,6,16,.95),transparent)",
+          padding: "8px 10px",
+          background: "linear-gradient(to bottom,rgba(9,9,15,.9),transparent)",
           display: "flex",
-          justifyContent: "space-between",
           alignItems: "center",
+          gap: 8,
         }}
       >
+        <div
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 2,
+            background: meta.color,
+            flexShrink: 0,
+          }}
+        />
         <span
           style={{
-            fontSize: 7,
-            letterSpacing: 3,
-            color: meta.color,
-            opacity: 0.9,
-            fontFamily: "'JetBrains Mono',monospace",
+            fontSize: 12,
+            fontWeight: 600,
+            color: "#fff",
+            textShadow: "0 1px 3px rgba(0,0,0,.8)",
           }}
         >
           {meta.label}
@@ -2523,34 +2299,34 @@ function MapTile({ meta, url, hovered, onEnter, onLeave, onDl }) {
           <button
             onClick={onDl}
             style={{
-              background: "none",
-              border: `1px solid ${meta.color}55`,
-              color: meta.color,
-              fontSize: 7,
-              letterSpacing: 2,
-              padding: "2px 6px",
+              marginLeft: "auto",
+              padding: "2px 8px",
+              borderRadius: 3,
+              fontSize: 11,
+              background: "rgba(255,255,255,.15)",
+              border: "1px solid rgba(255,255,255,.3)",
+              color: "#fff",
               cursor: "pointer",
-              borderRadius: 2,
-              fontFamily: "'JetBrains Mono',monospace",
-              opacity: 0.85,
+              backdropFilter: "blur(4px)",
             }}
           >
-            ↓
+            ↓ Save
           </button>
         )}
       </div>
+
+      {/* Bottom hint */}
       <div
         style={{
           position: "absolute",
           bottom: 0,
           left: 0,
           right: 0,
-          padding: "3px 7px",
-          background: "linear-gradient(to top,rgba(6,6,16,.9),transparent)",
-          fontSize: 5,
-          color: "#181828",
-          letterSpacing: 2,
-          fontFamily: "'JetBrains Mono',monospace",
+          padding: "8px 10px",
+          background: "linear-gradient(to top,rgba(9,9,15,.8),transparent)",
+          fontSize: 10,
+          color: "rgba(255,255,255,.4)",
+          textShadow: "0 1px 2px rgba(0,0,0,.8)",
         }}
       >
         {meta.hint}
