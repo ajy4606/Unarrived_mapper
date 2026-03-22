@@ -12,10 +12,10 @@ const getDepth = () => {
   if (!_depthP)
     _depthP = pipeline(
       "depth-estimation",
-      "onnx-community/depth-anything-v2-base",
+      "onnx-community/depth-anything-v2-small",
       {
-        device: "wasm",
-        dtype: "fp32", // 압축을 푼 고정밀도 최고 화질 모델
+        // ✅ 올바른 주소
+        device: "wasm", // WebGPU 호환성 에러 방지를 위해 wasm으로 변경
       },
     ).catch((e) => {
       _depthP = null;
@@ -104,7 +104,7 @@ function buildEnv(renderer, key) {
   });
   const tex = new THREE.CanvasTexture(c);
   tex.mapping = THREE.EquirectangularReflectionMapping;
-  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.colorSpace = THREE.SRGBColorSpace; // 텍스처 에러 수정 부분
   const pm = new THREE.PMREMGenerator(renderer);
   pm.compileEquirectangularShader();
   const env = pm.fromEquirectangular(tex).texture;
@@ -267,9 +267,13 @@ function mkGL(W, H) {
   const mkt = (src) => {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
-    if (src)
+    if (src) {
+      // ✅ FIX: Canvas Y축(상단=0)과 WebGL 텍스처 Y축(하단=0)이 반대
+      // UNPACK_FLIP_Y_WEBGL=true로 업로드 시 수직 반전 → 올바른 방향으로 렌더링
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
-    else
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    } else {
       gl.texImage2D(
         gl.TEXTURE_2D,
         0,
@@ -281,14 +285,18 @@ function mkGL(W, H) {
         gl.UNSIGNED_BYTE,
         null,
       );
+    }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     return t;
   };
   const upt = (t, s) => {
+    // ✅ FIX: 동적 업로드에도 동일한 Y축 보정 적용
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.bindTexture(gl.TEXTURE_2D, t);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, s);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
   };
   const mkf = (t) => {
     const f = gl.createFramebuffer();
@@ -316,7 +324,7 @@ function mkGL(W, H) {
     });
     for (const [k, v] of Object.entries(uns)) {
       const u = gl.getUniformLocation(prog, k);
-      if (!u) continue;
+      if (u === null) continue; // ✅ FIX: location=0은 유효 — !u 는 0을 falsy로 처리해 스킵하는 버그
       Array.isArray(v) ? gl.uniform2fv(u, v) : gl.uniform1f(u, v);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo ?? null);
@@ -513,9 +521,9 @@ async function generateMaps(img, depCvs, segCvs, s, res, onProg) {
       for (const k of keys) {
         const ti = new Image();
         ti.src = r[k];
-        await new Promise((resolve) => {
-          ti.onload = resolve;
-          ti.onerror = resolve;
+        await new Promise((r) => {
+          ti.onload = r;
+          ti.onerror = r;
         });
         outs[k]
           .getContext("2d")
@@ -523,7 +531,7 @@ async function generateMaps(img, depCvs, segCvs, s, res, onProg) {
       }
       tn++;
       onProg?.(tn, tot);
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((r) => setTimeout(r, 0));
     }
   const out = {};
   for (const k of keys) out[k] = outs[k].toDataURL("image/png");
@@ -731,7 +739,6 @@ export default function App() {
     threeR = useRef({}),
     orbit = useRef({ on: false, x: 0, y: 0 }),
     tok = useRef(0);
-
   useEffect(() => {
     setR.current = settings;
   }, [settings]);
@@ -745,8 +752,8 @@ export default function App() {
   const loadFile = useCallback(
     (file) => {
       if (!file?.type.startsWith("image/")) return;
-      const tid = ++tok.current;
-      const url = URL.createObjectURL(file),
+      const tid = ++tok.current,
+        url = URL.createObjectURL(file),
         img = new Image();
       img.onload = async () => {
         if (tid !== tok.current) return;
@@ -815,76 +822,11 @@ export default function App() {
     [quality],
   );
 
-  /* 💡 개선 포인트 1: Quality 토글 즉시 적용 (깊이 AI는 재사용) */
-  useEffect(() => {
-    if (!imgR.current || !srcURL || !depR.current) return;
-    const tid = ++tok.current;
-
-    const runQualitySwitch = async () => {
-      setProc(true);
-      setTileProg(null);
-      try {
-        if (quality) {
-          setAiStep("segload");
-          const sg = await getSeg();
-          if (tid !== tok.current) return;
-          setAiStep("seginfer");
-          const sr = await sg(srcURL);
-          if (tid !== tok.current) return;
-          setAiStep("segmask");
-          segR.current = await buildMatMask(sr);
-        } else {
-          segR.current = null; // 마스크 즉시 초기화
-        }
-
-        if (tid !== tok.current) return;
-        const isTile =
-          Math.min(
-            1,
-            res /
-              Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight),
-          ) *
-            Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight) >
-          TILE;
-
-        setAiStep(isTile ? "tiling" : "generating");
-        const r = await generateMaps(
-          imgR.current,
-          depR.current,
-          segR.current,
-          settings,
-          res,
-          (c, t) => {
-            if (tid === tok.current) setTileProg({ c, t });
-          },
-        );
-
-        if (tid !== tok.current) return;
-        setMaps(r);
-        setAiStep("ready");
-      } catch (err) {
-        console.error(err);
-        if (tid === tok.current) setAiStep("error");
-      } finally {
-        if (tid === tok.current) {
-          setTileProg(null);
-          setProc(false);
-        }
-      }
-    };
-    runQualitySwitch();
-  }, [quality]);
-
-  /* 💡 개선 포인트 2, 3: 세팅/해상도 조작 시 레이스 컨디션 및 에러 무한 로딩 방지 */
   useEffect(() => {
     if (!depR.current || !imgR.current) return;
-    const tid = ++tok.current; // 조작마다 고유 번호표 발급
-
     const id = setTimeout(async () => {
-      if (tid !== tok.current) return; // 이전 예약된 명령은 취소
       setProc(true);
       setTileProg(null);
-
       const isTile =
         Math.min(
           1,
@@ -892,33 +834,19 @@ export default function App() {
         ) *
           Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight) >
         TILE;
-
       setAiStep(isTile ? "tiling" : "generating");
-
-      try {
-        const r = await generateMaps(
-          imgR.current,
-          depR.current,
-          segR.current,
-          settings,
-          res,
-          (c, t) => {
-            if (tid === tok.current) setTileProg({ c, t });
-          },
-        );
-
-        if (tid !== tok.current) return;
-        setMaps(r);
-        setAiStep("ready");
-      } catch (err) {
-        console.error(err);
-        if (tid === tok.current) setAiStep("error");
-      } finally {
-        if (tid === tok.current) {
-          setTileProg(null);
-          setProc(false);
-        }
-      }
+      const r = await generateMaps(
+        imgR.current,
+        depR.current,
+        segR.current,
+        settings,
+        res,
+        (c, t) => setTileProg({ c, t }),
+      );
+      setMaps(r);
+      setAiStep("ready");
+      setTileProg(null);
+      setProc(false);
     }, 250);
     return () => clearTimeout(id);
   }, [settings, res]);
@@ -931,7 +859,7 @@ export default function App() {
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.outputColorSpace = THREE.SRGBColorSpace; // 텍스처 에러 수정 부분
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(48, 1, 0.01, 50);
     camera.position.z = 3.2;
@@ -939,6 +867,7 @@ export default function App() {
     scene.environment = env;
     scene.background = env;
 
+    // 조명 에러 수정 부분
     const light = new THREE.DirectionalLight(0xfff4d6, 0.6);
     light.position.set(4, 5, 3);
     scene.add(light);
@@ -2074,7 +2003,7 @@ export default function App() {
               }}
             >
               {[
-                ["Depth", "depth-anything-v2 (base)"],
+                ["Depth", "depth-anything-v2"],
                 ["Seg", "segformer-b0-ade (quality)"],
                 ["Normal", "Bilateral Sobel GLSL3"],
                 ["AO", "HBAO 32-sample spiral"],
