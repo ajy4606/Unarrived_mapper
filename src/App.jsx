@@ -183,8 +183,10 @@ async function buildMatMask(segs) {
 ═══════════════════════════════════════════════════════════════ */
 const VS = `#version 300 es\nin vec2 a;out vec2 v;\nvoid main(){v=a*.5+.5;gl_Position=vec4(a,0.,1.);}`;
 const FS_PASS = `#version 300 es\nprecision highp float;\nuniform sampler2D T;in vec2 v;out vec4 o;\nvoid main(){o=texture(T,v);}`;
-const FS_BH = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius;in vec2 v;out vec4 o;const float W[5]=float[](0.227027,0.194595,0.121622,0.054054,0.016216);void main(){vec4 c=texture(T,v)*W[0];for(int i=1;i<5;i++)c+=texture(T,v+vec2(float(i)*px.x*radius,0.))*W[i]+texture(T,v-vec2(float(i)*px.x*radius,0.))*W[i];o=c;}`;
-const FS_BV = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius;in vec2 v;out vec4 o;const float W[5]=float[](0.227027,0.194595,0.121622,0.054054,0.016216);void main(){vec4 c=texture(T,v)*W[0];for(int i=1;i<5;i++)c+=texture(T,v+vec2(0.,float(i)*px.y*radius))*W[i]+texture(T,v-vec2(0.,float(i)*px.y*radius))*W[i];o=c;}`;
+// FIX⑤: float[](...) → float[5](...) 명시적 크기 지정
+// unsized array constructor는 Intel/AMD 일부 WebGL 드라이버에서 컴파일 실패
+const FS_BH = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius;in vec2 v;out vec4 o;const float W[5]=float[5](0.227027,0.194595,0.121622,0.054054,0.016216);void main(){vec4 c=texture(T,v)*W[0];for(int i=1;i<5;i++)c+=texture(T,v+vec2(float(i)*px.x*radius,0.))*W[i]+texture(T,v-vec2(float(i)*px.x*radius,0.))*W[i];o=c;}`;
+const FS_BV = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius;in vec2 v;out vec4 o;const float W[5]=float[5](0.227027,0.194595,0.121622,0.054054,0.016216);void main(){vec4 c=texture(T,v)*W[0];for(int i=1;i<5;i++)c+=texture(T,v+vec2(0.,float(i)*px.y*radius))*W[i]+texture(T,v-vec2(0.,float(i)*px.y*radius))*W[i];o=c;}`;
 const FS_HP = `#version 300 es\nprecision highp float;\nuniform sampler2D ORIG,BLUR;in vec2 v;out vec4 o;void main(){o=clamp(texture(ORIG,v)-texture(BLUR,v)+vec4(.5),0.,1.);}`;
 const FS_NM = `#version 300 es\nprecision highp float;
 uniform sampler2D DEPTH,DETAIL;uniform vec2 px;uniform float str,detailMix,sigma;
@@ -215,8 +217,13 @@ void main(){
   float rp=.75;rp=mix(rp,.38,step(.5,cls)*step(cls,1.5));rp=mix(rp,.86,step(1.5,cls)*step(cls,2.5));rp=mix(rp,.92,step(2.5,cls)*step(cls,3.5));rp=mix(rp,.22,step(3.5,cls));
   l=mix(l,rp,matBlend);l=mix(l,1.-l,inv);o=vec4(vec3(clamp((l-.5)*con+.5+bias,0.,1.)),1.);}`;
 const FS_METAL = `#version 300 es\nprecision highp float;\nuniform sampler2D T,SEG;uniform float thr,soft;in vec2 v;out vec4 o;void main(){float l=texture(T,v).r;float cls=texture(SEG,v).r*4.;float bias=0.;bias=mix(bias,-.28,step(.5,cls)*step(cls,1.5));bias=mix(bias,.18,step(3.5,cls));float m=smoothstep(thr+bias-soft,thr+bias+soft,l);o=vec4(m,m,m,1.);}`;
-const FS_AO = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius,strength;in vec2 v;out vec4 o;const float G=2.3999632;const int S=32;void main(){float dc=texture(T,v).r,occ=0.,dMn=1.,dMx=0.;for(int dy=-2;dy<=2;dy++)for(int dx=-2;dx<=2;dx++){float s=texture(T,v+px*vec2(float(dx),float(dy))*4.).r;dMn=min(dMn,s);dMx=max(dMx,s);}float dr=max(dMx-dMn,.01),ar=radius/dr;for(int i=0;i<S;i++){float r=sqrt(float(i+1)/float(S)),th=float(i)*G;vec2 off=vec2(cos(th),sin(th))*px*min(ar,radius)*80.*r;occ+=clamp((dc-texture(T,v+off).r)*8.,0.,1.)*(1.-r)*.7+.3*(1.-r);}float ao=clamp(1.-(occ/float(S)*2.)*strength,0.,1.);o=vec4(ao,ao,ao,1.);}`;
-const FS_CURV = `#version 300 es\nprecision highp float;\nuniform sampler2D NM;uniform vec2 px;uniform float scale;in vec2 v;out vec4 o;float cs(float s){vec3 n=normalize(texture(NM,v).rgb*2.-1.);float d=0.;vec2[4] ds=vec2[4](vec2(px.x*s,0.),vec2(0.,px.y*s),vec2(-px.x*s,0.),vec2(0.,-px.y*s));for(int i=0;i<4;i++)d+=dot(n,normalize(texture(NM,v+ds[i]).rgb*2.-1.));return clamp(-(d/4.-1.)*scale*3.+.5,0.,1.);}void main(){float c=cs(1.)*.5+cs(4.)*.3+cs(12.)*.2;o=vec4(c,c,c,1.);}`;
+// FIX③: AO cosine weight 연산자 우선순위 버그
+// 이전: clamp(...)*(1.-r)*.7 + .3*(1.-r)  → (1-r)*(clamp*0.7 + 0.3)
+//       clamp=0일 때도 0.3*(1-r)이 occ에 누적 → 오클루전 없어도 어두워짐
+// 수정: cosW 변수 분리 → clamp=0이면 occ에 아무것도 누적 안 됨
+const FS_AO = `#version 300 es\nprecision highp float;\nuniform sampler2D T;uniform vec2 px;uniform float radius,strength;in vec2 v;out vec4 o;const float G=2.3999632;const int S=32;void main(){float dc=texture(T,v).r,occ=0.,dMn=1.,dMx=0.;for(int dy=-2;dy<=2;dy++)for(int dx=-2;dx<=2;dx++){float s=texture(T,v+px*vec2(float(dx),float(dy))*4.).r;dMn=min(dMn,s);dMx=max(dMx,s);}float dr=max(dMx-dMn,.01),ar=radius/dr;for(int i=0;i<S;i++){float r=sqrt(float(i+1)/float(S)),th=float(i)*G;vec2 off=vec2(cos(th),sin(th))*px*min(ar,radius)*80.*r;float diff=clamp((dc-texture(T,v+off).r)*8.,0.,1.);float cosW=(1.-r)*.7+.3;occ+=diff*cosW;}float ao=clamp(1.-(occ/float(S)*2.)*strength,0.,1.);o=vec4(ao,ao,ao,1.);}`;
+// FIX⑥: vec2[4] ds=vec2[4](...) constructor → 요소별 할당 (드라이버 비호환 방지)
+const FS_CURV = `#version 300 es\nprecision highp float;\nuniform sampler2D NM;uniform vec2 px;uniform float scale;in vec2 v;out vec4 o;float cs(float s){vec3 n=normalize(texture(NM,v).rgb*2.-1.);float d=0.;vec2 ds[4];ds[0]=vec2(px.x*s,0.);ds[1]=vec2(0.,px.y*s);ds[2]=vec2(-px.x*s,0.);ds[3]=vec2(0.,-px.y*s);for(int i=0;i<4;i++)d+=dot(n,normalize(texture(NM,v+ds[i]).rgb*2.-1.));return clamp(-(d/4.-1.)*scale*3.+.5,0.,1.);}void main(){float c=cs(1.)*.5+cs(4.)*.3+cs(12.)*.2;o=vec4(c,c,c,1.);}`;
 const FS_ORM = `#version 300 es\nprecision highp float;\nuniform sampler2D AO,RO,ME;in vec2 v;out vec4 o;void main(){o=vec4(texture(AO,v).r,texture(RO,v).r,texture(ME,v).r,1.);}`;
 
 /* ═══════════════════════════════════════════════════════════════
@@ -232,16 +239,33 @@ function mkGL(W, H) {
   if (!gl) return null;
   const mp = (fs) => {
     const p = gl.createProgram();
-    [
+    const shaders = [];
+    for (const [type, src] of [
       [gl.VERTEX_SHADER, VS],
       [gl.FRAGMENT_SHADER, fs],
-    ].forEach(([t, s]) => {
-      const sh = gl.createShader(t);
-      gl.shaderSource(sh, s);
+    ]) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
       gl.compileShader(sh);
+      // FIX④: 셰이더 컴파일 실패 시 에러 로그 출력 (이전엔 무음)
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+        console.error(
+          "[Shader compile]",
+          gl.getShaderInfoLog(sh),
+          "\n---\n",
+          src.slice(0, 200),
+        );
       gl.attachShader(p, sh);
-    });
+      shaders.push(sh);
+    }
     gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+      console.error("[Program link]", gl.getProgramInfoLog(p));
+    // 링크 후 셰이더 객체 해제 (GPU 메모리 절약)
+    shaders.forEach((sh) => {
+      gl.detachShader(p, sh);
+      gl.deleteShader(sh);
+    });
     return p;
   };
   const P = {
@@ -268,8 +292,8 @@ function mkGL(W, H) {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
     if (src) {
-      // ✅ FIX: Canvas Y축(상단=0)과 WebGL 텍스처 Y축(하단=0)이 반대
-      // UNPACK_FLIP_Y_WEBGL=true로 업로드 시 수직 반전 → 올바른 방향으로 렌더링
+      // FIX②: Canvas(위=0) vs WebGL 텍스처(아래=0) Y축 방향 불일치
+      // FLIP_Y=true로 업로드 시 수직 반전 → 올바른 방향으로 렌더링
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
@@ -292,7 +316,7 @@ function mkGL(W, H) {
     return t;
   };
   const upt = (t, s) => {
-    // ✅ FIX: 동적 업로드에도 동일한 Y축 보정 적용
+    // FIX②: 동적 업데이트에도 동일한 Y축 보정 적용
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     gl.bindTexture(gl.TEXTURE_2D, t);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, s);
@@ -324,7 +348,7 @@ function mkGL(W, H) {
     });
     for (const [k, v] of Object.entries(uns)) {
       const u = gl.getUniformLocation(prog, k);
-      if (u === null) continue; // ✅ FIX: location=0은 유효 — !u 는 0을 falsy로 처리해 스킵하는 버그
+      if (!u) continue;
       Array.isArray(v) ? gl.uniform2fv(u, v) : gl.uniform1f(u, v);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo ?? null);
@@ -441,7 +465,10 @@ function runTile(ctx, albC, depC, segC, W, H, s) {
   };
 }
 async function generateMaps(img, depCvs, segCvs, s, res, onProg) {
-  const sc = Math.min(1, res / Math.max(img.naturalWidth, img.naturalHeight));
+  // FIX①: Math.min(1, ...) 제거 — 이전 코드에서는 입력 이미지(예: 1525px)보다
+  // 큰 해상도(2048/4096/8192)를 선택해도 sc=1.0으로 고정되어 항상 원본 크기 출력.
+  // 이제 선택 해상도 기준으로 비례 확대/축소(긴 변 = res px 기준).
+  const sc = res / Math.max(img.naturalWidth, img.naturalHeight);
   const W = Math.round(img.naturalWidth * sc),
     H = Math.round(img.naturalHeight * sc);
   const neutral =
@@ -787,13 +814,8 @@ export default function App() {
           setAiStep("generating");
           await new Promise((r) => requestAnimationFrame(r));
           if (tid !== tok.current) return;
-          const isTile =
-            Math.min(
-              1,
-              resR.current / Math.max(img.naturalWidth, img.naturalHeight),
-            ) *
-              Math.max(img.naturalWidth, img.naturalHeight) >
-            TILE;
+          // FIX⑨: Math.min(1,...) 제거 → generateMaps와 동일 로직
+          const isTile = resR.current > TILE;
           if (isTile) setAiStep("tiling");
           const result = await generateMaps(
             imgR.current,
@@ -824,29 +846,39 @@ export default function App() {
 
   useEffect(() => {
     if (!depR.current || !imgR.current) return;
+    const tid = ++tok.current;
     const id = setTimeout(async () => {
+      if (tid !== tok.current) return;
       setProc(true);
       setTileProg(null);
-      const isTile =
-        Math.min(
-          1,
-          res / Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight),
-        ) *
-          Math.max(imgR.current.naturalWidth, imgR.current.naturalHeight) >
-        TILE;
+      // FIX⑨: Math.min(1,...) 제거 — generateMaps와 동일한 로직으로 isTile 판단
+      const isTile = res > TILE;
       setAiStep(isTile ? "tiling" : "generating");
-      const r = await generateMaps(
-        imgR.current,
-        depR.current,
-        segR.current,
-        settings,
-        res,
-        (c, t) => setTileProg({ c, t }),
-      );
-      setMaps(r);
-      setAiStep("ready");
-      setTileProg(null);
-      setProc(false);
+      try {
+        const r = await generateMaps(
+          imgR.current,
+          depR.current,
+          segR.current,
+          settings,
+          res,
+          (c, t) => {
+            if (tid === tok.current) setTileProg({ c, t });
+          },
+        );
+        if (tid !== tok.current) return;
+        setMaps(r);
+        setAiStep("ready");
+      } catch (err) {
+        // FIX⑧: try/catch 누락 — 에러 시 setProc(false)가 호출 안 돼 영구 로딩 고착
+        if (tid !== tok.current) return;
+        console.error("[Mapper regen]", err);
+        setAiStep("error");
+      } finally {
+        if (tid === tok.current) {
+          setTileProg(null);
+          setProc(false);
+        }
+      }
     }, 250);
     return () => clearTimeout(id);
   }, [settings, res]);
@@ -944,9 +976,12 @@ export default function App() {
   useEffect(() => {
     const { renderer, scene } = threeR.current;
     if (!renderer || !scene) return;
+    // FIX⑦: 이전 envMap dispose 누락 → HDRI 전환마다 GPU에 ~4MB 텍스처 누적
+    const prev = scene.environment;
     const e = buildEnv(renderer, hdri);
     scene.environment = e;
     scene.background = e;
+    prev?.dispose();
   }, [hdri]);
   useEffect(() => {
     const { mesh, G } = threeR.current;
